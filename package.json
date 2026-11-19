@@ -1,0 +1,11 @@
+{
+  "name": "@notchlet/core",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }, "./git-context": { "types": "./dist/git-context.d.ts", "import": "./dist/git-context.js" }, "./evidence": { "types": "./dist/evidence.d.ts", "import": "./dist/evidence.js" }, "./resume": { "types": "./dist/resume.d.ts", "import": "./dist/resume.js" }, "./closure": { "types": "./dist/closure.d.ts", "import": "./dist/closure.js" } },
+  "files": ["dist/index.js", "dist/index.d.ts", "dist/git-context.js", "dist/git-context.d.ts", "dist/evidence.js", "dist/evidence.d.ts", "dist/resume.js", "dist/resume.d.ts", "dist/closure.js", "dist/closure.d.ts", "schemas", "fixtures"],
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node --test dist/*.test.js" },
+  "devDependencies": { "@types/node": "^22.15.0", "typescript": "^5.8.3" }
+}

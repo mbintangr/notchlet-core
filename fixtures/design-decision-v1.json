@@ -1,0 +1,1 @@
+{"id":"DECISION-1","decision":"Use a deterministic local index","rationale":"It meets the query requirements without a network dependency."}

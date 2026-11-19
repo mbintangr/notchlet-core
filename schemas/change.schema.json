@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notchlet.dev/schemas/change-v1.schema.json",
+  "title": "Notchlet change v1",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "createdAt", "mode", "intent", "outcome", "requirements", "checks", "tasks", "artifacts"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "mode": { "enum": ["quick", "standard"] },
+    "intent": { "type": "string", "minLength": 1 },
+    "outcome": { "type": "string", "minLength": 1 },
+    "requirements": { "type": "array", "items": { "$ref": "./requirement.v1.schema.json" } },
+    "acceptanceScenarios": { "type": "array", "items": { "$ref": "./acceptance-scenario.v1.schema.json" } },
+    "designDecisions": { "type": "array", "items": { "$ref": "./design-decision.v1.schema.json" } },
+    "checks": { "type": "array", "items": { "$ref": "./check.v1.schema.json" } },
+    "tasks": { "type": "array", "items": { "$ref": "./task.v1.schema.json" } },
+    "artifacts": { "type": "object", "additionalProperties": { "type": "string" } },
+    "revision": { "type": "integer", "minimum": 0 },
+    "baselineRevision": { "type": "integer", "minimum": 0 },
+    "capabilityName": { "type": "string", "minLength": 1 },
+    "capabilityImpact": { "enum": ["none", "delta"] },
+    "capabilityRationale": { "type": "string" },
+    "capabilityDelta": {
+      "type": "object",
+      "required": ["operations"],
+      "properties": {
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["operation", "requirementId", "rationale"],
+            "properties": {
+              "operation": { "enum": ["add", "update", "remove"] },
+              "requirementId": { "type": "string", "minLength": 1 },
+              "requirement": { "$ref": "./requirement.v1.schema.json" },
+              "scenarios": { "type": "array", "items": { "$ref": "./acceptance-scenario.v1.schema.json" } },
+              "rationale": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
