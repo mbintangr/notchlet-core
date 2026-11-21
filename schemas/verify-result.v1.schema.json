@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notchlet.dev/schemas/verify-result-v1.schema.json",
+  "title": "Notchlet verify result v1",
+  "type": "object",
+  "required": ["changeId", "runnable", "outcome", "total", "passed", "failed", "skipped", "results"],
+  "properties": {
+    "changeId": { "type": "string", "minLength": 1 },
+    "runnable": { "type": "integer", "minimum": 0 },
+    "outcome": { "enum": ["passed", "failed", "informational"] },
+    "total": { "type": "integer", "minimum": 0 },
+    "passed": { "type": "integer", "minimum": 0 },
+    "failed": { "type": "integer", "minimum": 0 },
+    "skipped": { "type": "integer", "minimum": 0 },
+    "results": { "type": "array", "items": { "type": "object", "required": ["id", "kind", "status"] } },
+    "readiness": { "type": "object" },
+    "serve": { "type": "object" },
+    "setup": { "type": "object" },
+    "setupSkippedReason": { "type": "string" },
+    "setupPreflight": { "type": "object" },
+    "teardown": { "type": "object" },
+    "environment": { "type": "object" },
+    "commandIsolation": { "type": "array", "items": { "type": "string" } },
+    "repeat": { "type": "object" },
+    "failurePhase": { "enum": ["setup", "readiness", "checks", "repeat"] },
+    "blocked": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

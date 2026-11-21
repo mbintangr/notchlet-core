@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notchlet.dev/schemas/spec-v1.schema.json",
+  "title": "Notchlet specification document v1",
+  "type": "object",
+  "required": ["schemaVersion", "change", "requirements"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "change": { "type": "object", "required": ["id", "name", "mode"] },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "description", "scenarios", "taskIds", "checkIds"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "scenarios": { "type": "array", "items": { "$ref": "./acceptance-scenario.v1.schema.json" } },
+          "taskIds": { "type": "array", "items": { "type": "string" } },
+          "checkIds": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

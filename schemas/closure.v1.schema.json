@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notchlet.dev/schemas/closure-v1.schema.json",
+  "title": "Notchlet closure manifest v1",
+  "type": "object",
+  "required": ["schemaVersion", "changeId", "changeName", "mode", "closedAt", "revision", "contribution", "capability", "verification", "tasks", "checks", "requirements", "scenarios", "coverage", "artifacts", "evidence", "remoteDelivery"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "changeId": { "type": "string", "minLength": 1 },
+    "changeName": { "type": "string", "minLength": 1 },
+    "mode": { "enum": ["quick", "standard"] },
+    "closedAt": { "type": "string", "format": "date-time" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "contentRevision": { "type": "integer", "minimum": 0 },
+    "contribution": { "enum": ["none", "delta", "standard"] },
+    "capability": {
+      "type": "object",
+      "required": ["name"],
+      "properties": { "name": { "type": "string" }, "baselineWritten": { "type": "boolean" }, "baselineRevision": { "type": "integer" }, "resultingRevision": { "type": "integer" }, "rationale": { "type": "string" }, "deltaOperations": { "type": "integer", "minimum": 0 } }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["status", "basis", "current", "failed", "stale", "unknown", "missing"],
+      "properties": { "status": { "enum": ["not_applicable", "missing", "failed", "stale", "unknown", "current"] }, "basis": { "enum": ["git", "artifact", "mixed", "none"] }, "evidenceId": { "type": "string" }, "current": { "type": "array", "items": { "type": "string" } }, "failed": { "type": "array", "items": { "type": "string" } }, "stale": { "type": "array", "items": { "type": "string" } }, "unknown": { "type": "array", "items": { "type": "string" } }, "missing": { "type": "array", "items": { "type": "string" } } }
+    },
+    "tasks": { "type": "object", "required": ["total", "completed", "ids"] },
+    "checks": { "type": "object", "required": ["total", "ids"] },
+    "requirements": { "type": "object", "required": ["total", "ids"] },
+    "scenarios": { "type": "integer", "minimum": 0 },
+    "coverage": {
+      "type": "object",
+      "required": ["policy", "complete", "requirements", "scenarios", "tasks", "unlinkedChecks"],
+      "properties": {
+        "policy": { "enum": ["advisory", "strict"] },
+        "complete": { "type": "boolean" },
+        "requirements": { "type": "object", "required": ["total", "covered", "uncovered", "items"] },
+        "scenarios": { "type": "object", "required": ["total", "covered", "uncovered", "items"] },
+        "tasks": { "type": "object", "required": ["total", "covered", "uncovered", "items"] },
+        "unlinkedChecks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "artifacts": { "type": "array", "items": { "type": "object", "required": ["artifact", "path", "role", "status"] } },
+    "artifactRefresh": { "enum": ["generated-state", "none"] },
+    "plan": {
+      "type": "object",
+      "required": ["status", "validation", "acceptedDrift", "checkedAt"],
+      "properties": {
+        "status": { "enum": ["unlinked", "current", "drifted", "missing"] },
+        "path": { "type": "string" },
+        "recordedSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "currentSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "contractSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "validation": { "enum": ["ok", "invalid", "not_applicable"] },
+        "validationError": { "type": "string" },
+        "acceptedDrift": { "type": "boolean" },
+        "checkedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["records", "current", "superseded", "attachments", "items", "logs"],
+      "properties": {
+        "records": { "type": "integer", "minimum": 0 },
+        "current": { "type": "integer", "minimum": 0 },
+        "superseded": { "type": "integer", "minimum": 0 },
+        "attachments": { "type": "integer", "minimum": 0 },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["evidenceId", "status", "outcome", "summary", "capturedAt", "provenance", "requirementIds", "scenarioIds", "taskIds", "checkIds", "attachments"],
+            "properties": {
+              "evidenceId": { "type": "string" },
+              "status": { "enum": ["current", "superseded"] },
+              "outcome": { "enum": ["passed", "failed", "informational"] },
+              "summary": { "type": "string" },
+              "capturedAt": { "type": "string", "format": "date-time" },
+              "provenance": { "type": "string" },
+              "requirementIds": { "type": "array", "items": { "type": "string" } },
+              "scenarioIds": { "type": "array", "items": { "type": "string" } },
+              "taskIds": { "type": "array", "items": { "type": "string" } },
+              "checkIds": { "type": "array", "items": { "type": "string" } },
+              "capture": {
+                "type": "object",
+                "properties": {
+                  "url": { "type": "string" },
+                  "browser": { "type": "string" },
+                  "capturedAt": { "type": "string" },
+                  "title": { "type": "string" },
+                  "fullPage": { "type": "boolean" },
+                  "viewport": { "type": "object", "properties": { "width": { "type": "integer" }, "height": { "type": "integer" } } },
+                  "wait": { "type": "object", "properties": { "settleMs": { "type": "integer" }, "waitFor": { "type": "string" }, "waitedMs": { "type": "integer" }, "matched": { "type": "boolean" } } },
+                  "console": { "type": "object" }
+                }
+              },
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "path", "sha256", "bytes"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "path": { "type": "string" },
+                    "sha256": { "type": "string" },
+                    "bytes": { "type": "integer", "minimum": 0 },
+                    "mediaType": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "description": { "type": "string" },
+                    "provenance": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "logs": { "type": "array" }
+      }
+    },
+    "remoteDelivery": { "type": "object", "required": ["status"], "properties": { "status": { "enum": ["not_configured", "unknown", "not_delivered", "delivered"] } } }
+  },
+  "additionalProperties": false
+}

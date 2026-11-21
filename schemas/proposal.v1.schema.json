@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notchlet.dev/schemas/proposal-v1.schema.json",
+  "title": "Notchlet proposal document v1",
+  "type": "object",
+  "required": ["schemaVersion", "change", "requirements", "acceptanceScenarios", "designDecisions", "checks", "tasks", "capability"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "change": { "type": "object", "required": ["id", "name", "mode", "intent", "outcome"] },
+    "requirements": { "type": "array", "items": { "$ref": "./requirement.v1.schema.json" } },
+    "acceptanceScenarios": { "type": "array", "items": { "$ref": "./acceptance-scenario.v1.schema.json" } },
+    "designDecisions": { "type": "array", "items": { "$ref": "./design-decision.v1.schema.json" } },
+    "checks": { "type": "array", "items": { "$ref": "./check.v1.schema.json" } },
+    "tasks": { "type": "array", "items": { "type": "object", "required": ["id", "title", "dependencies", "requirementIds"] } },
+    "capability": { "type": "object", "required": ["deltaOperations"] }
+  },
+  "additionalProperties": false
+}

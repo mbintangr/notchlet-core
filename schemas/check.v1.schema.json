@@ -1,1 +1,74 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://notchlet.dev/schemas/check-v1.schema.json","title":"Notchlet check v1","type":"object","required":["id","description"],"properties":{"id":{"type":"string","minLength":1},"description":{"type":"string","minLength":1}},"additionalProperties":false}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://notchlet.dev/schemas/check-v1.schema.json",
+  "title": "Notchlet check v1",
+  "type": "object",
+  "required": ["id", "description"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["command", "manual", "browser", "http", "ui"] },
+    "command": { "type": "string", "minLength": 1 },
+    "url": { "type": "string", "minLength": 1 },
+    "expectedStatus": { "type": "integer", "minimum": 100, "maximum": 599 },
+    "waitFor": { "type": "string", "minLength": 1 },
+    "settleMs": { "type": "integer", "minimum": 0 },
+    "expectedSelectors": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "expectedVisibleSelectors": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "expectedEnabledSelectors": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "expectedScopedText": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["selector", "contains"],
+        "properties": { "selector": { "type": "string", "minLength": 1 }, "contains": { "type": "string", "minLength": 1 } },
+        "additionalProperties": false
+      }
+    },
+    "expectedText": { "type": "string", "minLength": 1 },
+    "expectedTitle": { "type": "string", "minLength": 1 },
+    "expectedNoConsoleErrors": { "type": "boolean" },
+    "fullPage": { "type": "boolean" },
+    "captureArtifacts": { "enum": ["never", "on-failure", "always"] },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+          "action": { "enum": ["fill", "click", "select", "press", "waitFor", "waitForVisible", "waitForText", "assertText", "assertUrl", "settle"] },
+          "selector": { "type": "string", "minLength": 1 },
+          "value": { "type": "string" },
+          "key": { "type": "string", "minLength": 1 },
+          "text": { "type": "string", "minLength": 1 },
+          "contains": { "type": "string", "minLength": 1 },
+          "timeoutMs": { "type": "integer", "minimum": 0 },
+          "ms": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "expectedBodyContains": { "type": "string", "minLength": 1 },
+    "expectedJson": { "type": "object" },
+    "expectedJsonContains": {},
+    "expectedJsonAt": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "properties": { "path": { "type": "string", "minLength": 1 }, "equals": {}, "gte": { "type": "number" }, "lte": { "type": "number" }, "matches": { "type": "string", "minLength": 1 } },
+        "additionalProperties": false
+      }
+    },
+    "expectedHeaders": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
+    "workingDirectory": { "type": "string", "minLength": 1 },
+    "environment": { "type": "object", "additionalProperties": { "type": "string" } },
+    "requirementIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "scenarioIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "taskIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+  },
+  "additionalProperties": false
+}
