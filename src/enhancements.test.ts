@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { completeTasks, evaluateState, initWorkspace, instructions, parseChange, persistChangeOperations, previewPlanReadiness, scaffold, seedCapabilityDeltaOperations, validateChangeStructure, type AcceptanceScenario, type Change, type Requirement } from './index.js';
+import { completeTasks, deriveState, evaluateState, initWorkspace, instructions, parseChange, persistChangeOperations, previewPlanReadiness, scaffold, seedCapabilityDeltaOperations, validateChangeStructure, type AcceptanceScenario, type Change, type Requirement } from './index.js';
 
 const requirement: Requirement = { id: 'REQ-1', title: 'Behavior', description: 'Provide the behavior.' };
 const scenario: AcceptanceScenario = { id: 'SCENARIO-1', requirementId: 'REQ-1', when: 'It is used', then: 'It works.' };
@@ -121,6 +121,36 @@ test('state evaluation merges closure blockers and archived instructions report 
   assert.match(checkText, /CHECK-CMD[\s\S]*Command: `npm test`/);
   assert.match(checkText, /CHECK-URL[\s\S]*URL: https:\/\/example\.com\/health \(expect HTTP 204\)/);
   assert.match(checkText, /CHECK-MANUAL[\s\S]*Manual check: record evidence/);
+});
+
+test('rollup instruction context reports parent readiness without leaf content', () => {
+  const change: Change = {
+    schemaVersion: 1,
+    id: 'rollup-epic',
+    name: 'Rollup epic',
+    createdAt: new Date(0).toISOString(),
+    mode: 'quick',
+    capabilityImpact: 'none',
+    capabilityRationale: 'Parent backlog item; children declare capability deltas.',
+    intent: 'Coordinate the epic through its children.',
+    outcome: 'The epic is complete when its child changes are closed.',
+    requirements: [],
+    acceptanceScenarios: [],
+    designDecisions: [],
+    checks: [],
+    tasks: [],
+    artifacts: { 'proposal.json': 'proposal.json' },
+    revision: 1,
+  };
+  const leaf = instructions(change, 'resume');
+  assert.match(leaf, /Planning blockers: missing_requirements, missing_checks, missing_tasks/);
+  assert.match(leaf, /Planning readiness: blocked/);
+  assert.match(deriveState(change), /Planning readiness: blocked/);
+
+  const parent = instructions(change, 'resume', { rollup: true });
+  assert.match(parent, /Planning blockers: none\./);
+  assert.match(parent, /Planning readiness: ready/);
+  assert.match(deriveState(change, { rollup: true }), /Planning readiness: ready/);
 });
 
 test('check kinds require their matching transport fields', async () => {
