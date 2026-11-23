@@ -180,6 +180,16 @@ test('closure Markdown leads with current evidence and keeps multiline detail ne
     scenarios: 0,
     coverage: coverageReport(change),
     artifacts: [],
+    rollup: {
+      children: [{
+        changeId: 'login',
+        relativePath: 'auth/login',
+        closedAt: now,
+        closureSha256: 'c'.repeat(64),
+        contribution: 'none',
+        verification: { status: 'not_applicable', basis: 'none' },
+      }],
+    },
     evidence: {
       records: 2,
       current: 1,
@@ -209,4 +219,6 @@ test('closure Markdown leads with current evidence and keeps multiline detail ne
   assert.match(markdown, /\n  first detail\n/);
   assert.match(markdown, /\n  - bullet detail\n/);
   assert.match(markdown, /- Attachment screen\.png \[screenshot\]/);
+  assert.match(markdown, /## Rollup children/);
+  assert.match(markdown, /auth\/login \(login\): not_applicable \(none basis\), contribution none, closed .*, closure sha256 c{64}/);
 });

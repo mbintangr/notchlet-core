@@ -38,9 +38,10 @@ test('reports changed HEAD and dirty local worktree conflicts',async()=>{
 test('evidence freshness distinguishes stale and unknown observations',async()=>{
  const {root}=await setup(); try {
   await appendEvidence(root,'resume-test',{kind:'note',outcome:'informational',summary:'Captured',requirementIds:[],taskIds:[],provenance:'recorded'});
-  const dir=path.join(root,'.notchlet','changes','resume-test'), change=JSON.parse(await (await import('node:fs/promises')).readFile(path.join(dir,'tasks.json'),'utf8')); change.revision++; await writeFile(path.join(dir,'tasks.json'),JSON.stringify(change));
+  const dir=path.join(root,'.notchlet','changes','resume-test');
+  await writeFile(path.join(root,'tracked.txt'),'changed');
   const e=(await readResume(root,'resume-test',{section:'evidence'}).then(x=>x.data as any[]))[0]; assert.equal(e.freshness.status,'stale');
-  change.revision--; await writeFile(path.join(dir,'tasks.json'),JSON.stringify(change));
+  await writeFile(path.join(root,'tracked.txt'),'initial');
   const evidencePath=path.join(dir,'evidence.jsonl'), raw=JSON.parse((await (await import('node:fs/promises')).readFile(evidencePath,'utf8')).trim()); raw.git.tracked.truncated=true; await writeFile(evidencePath,JSON.stringify(raw)+'\n');
   const unknown=(await readResume(root,'resume-test',{section:'evidence'}).then(x=>x.data as any[]))[0]; assert.equal(unknown.freshness.status,'unknown');
  } finally {await rm(root,{recursive:true,force:true});}

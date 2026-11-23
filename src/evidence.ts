@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { access, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { inspectGitContext, type GitContextResult } from './git-context.js';
+import { fingerprintWorkspace, type WorkspaceFingerprint } from './source-files.js';
 import { parseChange, WorkflowError, type Change } from './index.js';
+import { resolveChangeLocation } from './paths.js';
 
 export type EvidenceKind = 'check' | 'note' | 'artifact';
 export type EvidenceOutcome = 'passed' | 'failed' | 'informational';
@@ -62,13 +64,24 @@ export interface EvidenceRecord {
   schemaVersion: 1; id: string; kind: EvidenceKind; outcome: EvidenceOutcome; summary: string;
   command?: string; requirementIds: string[]; scenarioIds?: string[]; taskIds: string[]; checkIds?: string[]; capturedAt: string; provenance: EvidenceProvenance;
   changeRevision: number; contentRevision?: number; artifactHash: string; /** Version 2 content fingerprint that ignores derived Markdown views. */ verificationFingerprint?: string; fingerprintVersion?: 2; git: GitContextResult;
+  /** Bounded source-content fingerprint for workspaces without Git. */
+  source?: WorkspaceFingerprint;
   environment?: EvidenceEnvironment;
   capture?: EvidenceCapture;
   logPath?: string; logHash?: string; logBytes?: number; attachments?: EvidenceAttachment[];
 }
-export type EvidenceWriteInput = Omit<EvidenceRecord, 'schemaVersion'|'id'|'capturedAt'|'changeRevision'|'contentRevision'|'artifactHash'|'git'|'provenance'> & { provenance: 'recorded' | 'imported'; id?: string; capturedAt?: string };
+export type EvidenceWriteInput = Omit<EvidenceRecord, 'schemaVersion'|'id'|'capturedAt'|'changeRevision'|'contentRevision'|'artifactHash'|'git'|'source'|'provenance'> & { provenance: 'recorded' | 'imported'; id?: string; capturedAt?: string };
 export interface EvidenceAttachmentInput { path: string; name?: string; kind?: EvidenceAttachmentKind; description?: string; provenance?: EvidenceAttachment['provenance']; }
-export interface EvidenceFreshness { status: 'fresh' | 'stale' | 'unknown'; basis: 'git' | 'artifact'; reasons: string[]; independentlyVerified: boolean; }
+export interface EvidenceFreshness { status: 'fresh' | 'stale' | 'unknown'; basis: 'git' | 'artifact'; /** Whether the recorded evidence binds application source, not only change artifacts. */ sourceBound?: boolean; reasons: string[]; independentlyVerified: boolean; }
+export interface SourceBindingSummary {
+  basis: 'git' | 'artifact' | 'mixed' | 'none';
+  /** True when every current check observes source through Git or a workspace fingerprint. */
+  bound: boolean;
+  currentChecks: number;
+  gitChecks: number;
+  workspaceChecks: number;
+  unboundChecks: number;
+}
 export type CheckFacetStatus = 'missing' | 'failed' | 'stale' | 'unknown' | 'current';
 export interface CheckFacet { checkId: string; status: CheckFacetStatus; evidenceId?: string; freshness?: EvidenceFreshness; }
 export interface VerificationFacets {
@@ -91,18 +104,15 @@ export interface TaskEvidenceStatus {
 }
 
 const hash = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
-function changeDir(root: string, id: string): string {
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) throw new Error(`Invalid change ID: ${id}`);
-  return path.join(path.resolve(root), '.notchlet', 'changes', id);
+async function changeDir(root: string, id: string): Promise<string> {
+  try { return (await resolveChangeLocation(root, id, { scope: 'active' })).directory; }
+  catch (error) {
+    if (error instanceof WorkflowError && (error.code === 'invalid_change_path' || error.code === 'path_budget_exceeded')) throw new Error(`Invalid change ID: ${id}`);
+    throw error;
+  }
 }
 async function readableChangeDir(root: string, id: string): Promise<string> {
-  const active = changeDir(root, id);
-  try { await access(path.join(active, 'tasks.json')); return active; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  const archived = path.join(path.resolve(root), '.notchlet', 'archive', id);
-  try { await access(path.join(archived, 'tasks.json')); return archived; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  throw new Error(`Change not found: ${id}`);
+  return (await resolveChangeLocation(root, id, { scope: 'merged' })).directory;
 }
 const DERIVED_VIEWS = new Set(['tasks.json', 'tasks.md', 'proposal.json', 'proposal.md', 'spec.json', 'spec.md']);
 function changeContent(change: Change): unknown {
@@ -197,10 +207,18 @@ function validCapture(value: unknown): value is EvidenceCapture {
     && (capture.title === undefined || typeof capture.title === 'string')
     && (capture.viewport === undefined || (typeof capture.viewport === 'object' && capture.viewport !== null && Number.isInteger((capture.viewport as Record<string, unknown>).width) && Number.isInteger((capture.viewport as Record<string, unknown>).height)));
 }
+function validWorkspaceFingerprint(value: unknown): value is WorkspaceFingerprint {
+  if (!value || typeof value !== 'object') return false;
+  const source = value as Record<string, unknown>;
+  return source.algorithm === 'sha256' && typeof source.digest === 'string' && /^[a-f0-9]{64}$/.test(source.digest)
+    && Number.isInteger(source.files) && (source.files as number) >= 0
+    && Number.isInteger(source.bytesHashed) && (source.bytesHashed as number) >= 0
+    && typeof source.truncated === 'boolean';
+}
 export function parseEvidenceRecord(value: unknown): EvidenceRecord {
   if (!value || typeof value !== 'object') throw new Error('Evidence record must be an object.');
   const r = value as Record<string, unknown>;
-  if (r.schemaVersion !== 1 || typeof r.id !== 'string' || !r.id || !['check','note','artifact'].includes(String(r.kind)) || !['passed','failed','informational'].includes(String(r.outcome)) || typeof r.summary !== 'string' || !r.summary.trim() || !Array.isArray(r.requirementIds) || !r.requirementIds.every(x => typeof x === 'string') || (r.scenarioIds !== undefined && (!Array.isArray(r.scenarioIds) || !r.scenarioIds.every(x => typeof x === 'string' && x.length > 0) || new Set(r.scenarioIds).size !== r.scenarioIds.length)) || !Array.isArray(r.taskIds) || !r.taskIds.every(x => typeof x === 'string') || (r.checkIds !== undefined && (!Array.isArray(r.checkIds) || !r.checkIds.every(x => typeof x === 'string' && x.length > 0) || new Set(r.checkIds).size !== r.checkIds.length)) || typeof r.capturedAt !== 'string' || !Number.isFinite(Date.parse(r.capturedAt)) || !['recorded','imported','locally-observed'].includes(String(r.provenance)) || !Number.isInteger(r.changeRevision) || (r.contentRevision !== undefined && (!Number.isInteger(r.contentRevision) || (r.contentRevision as number) < 0)) || typeof r.artifactHash !== 'string' || (r.verificationFingerprint !== undefined && (typeof r.verificationFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(r.verificationFingerprint))) || (r.fingerprintVersion !== undefined && r.fingerprintVersion !== 2) || !r.git || typeof r.git !== 'object' || (r.environment !== undefined && !validEnvironment(r.environment)) || (r.capture !== undefined && !validCapture(r.capture)) || (r.command !== undefined && typeof r.command !== 'string') || (r.logPath !== undefined && (typeof r.logPath !== 'string' || !r.logPath.trim())) || (r.logHash !== undefined && (typeof r.logHash !== 'string' || !/^[a-f0-9]{64}$/.test(r.logHash))) || (r.logBytes !== undefined && (!Number.isInteger(r.logBytes) || (r.logBytes as number) < 0)) || ((r.logPath === undefined) !== (r.logHash === undefined)) || (r.attachments !== undefined && (!Array.isArray(r.attachments) || !r.attachments.every(validAttachment)))) throw new Error('Invalid evidence record schema.');
+  if (r.schemaVersion !== 1 || typeof r.id !== 'string' || !r.id || !['check','note','artifact'].includes(String(r.kind)) || !['passed','failed','informational'].includes(String(r.outcome)) || typeof r.summary !== 'string' || !r.summary.trim() || !Array.isArray(r.requirementIds) || !r.requirementIds.every(x => typeof x === 'string') || (r.scenarioIds !== undefined && (!Array.isArray(r.scenarioIds) || !r.scenarioIds.every(x => typeof x === 'string' && x.length > 0) || new Set(r.scenarioIds).size !== r.scenarioIds.length)) || !Array.isArray(r.taskIds) || !r.taskIds.every(x => typeof x === 'string') || (r.checkIds !== undefined && (!Array.isArray(r.checkIds) || !r.checkIds.every(x => typeof x === 'string' && x.length > 0) || new Set(r.checkIds).size !== r.checkIds.length)) || typeof r.capturedAt !== 'string' || !Number.isFinite(Date.parse(r.capturedAt)) || !['recorded','imported','locally-observed'].includes(String(r.provenance)) || !Number.isInteger(r.changeRevision) || (r.contentRevision !== undefined && (!Number.isInteger(r.contentRevision) || (r.contentRevision as number) < 0)) || typeof r.artifactHash !== 'string' || (r.verificationFingerprint !== undefined && (typeof r.verificationFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(r.verificationFingerprint))) || (r.fingerprintVersion !== undefined && r.fingerprintVersion !== 2) || (r.source !== undefined && !validWorkspaceFingerprint(r.source)) || !r.git || typeof r.git !== 'object' || (r.environment !== undefined && !validEnvironment(r.environment)) || (r.capture !== undefined && !validCapture(r.capture)) || (r.command !== undefined && typeof r.command !== 'string') || (r.logPath !== undefined && (typeof r.logPath !== 'string' || !r.logPath.trim())) || (r.logHash !== undefined && (typeof r.logHash !== 'string' || !/^[a-f0-9]{64}$/.test(r.logHash))) || (r.logBytes !== undefined && (!Number.isInteger(r.logBytes) || (r.logBytes as number) < 0)) || ((r.logPath === undefined) !== (r.logHash === undefined)) || (r.attachments !== undefined && (!Array.isArray(r.attachments) || !r.attachments.every(validAttachment)))) throw new Error('Invalid evidence record schema.');
   return r as unknown as EvidenceRecord;
 }
 
@@ -222,8 +240,7 @@ export async function readEvidence(root: string, id: string): Promise<EvidenceRe
 
 /** Appends user-supplied evidence; command is descriptive only and is never run. */
 export async function appendEvidence(root: string, changeId: string, input: EvidenceWriteInput): Promise<EvidenceRecord> {
-  const dir = changeDir(root, changeId); const change = parseChange(await readFile(path.join(dir, 'tasks.json'), 'utf8'));
-  if (change.id !== changeId) throw new Error('Change ID does not match its directory.');
+  const dir = await changeDir(root, changeId); const change = parseChange(await readFile(path.join(dir, 'tasks.json'), 'utf8'));
   const reqs = new Set(change.requirements.map(x => x.id)), tasks = new Set(change.tasks.map(x => x.id));
   if (input.requirementIds.some(x => !reqs.has(x))) throw new Error('Evidence references an unknown requirement ID.');
   const scenarios = new Set(change.acceptanceScenarios.map(x => x.id));
@@ -236,8 +253,10 @@ export async function appendEvidence(root: string, changeId: string, input: Evid
   try {
     const fingerprint = await artifactHash(dir, change);
     const existing = await readEvidence(root, changeId);
+    const git = await inspectGitContext(root);
+    const source = git.isRepository ? undefined : await fingerprintWorkspace(root);
     // Parsing verifies that every attachment path stays inside the change directory.
-    const record = parseEvidenceRecord({ ...input, schemaVersion: 1, id: input.id ?? randomUUID(), capturedAt: input.capturedAt ?? new Date().toISOString(), changeRevision: change.revision ?? 0, ...(change.contentRevision === undefined ? {} : { contentRevision: change.contentRevision }), artifactHash: fingerprint, verificationFingerprint: fingerprint, fingerprintVersion: 2, git: await inspectGitContext(root) });
+    const record = parseEvidenceRecord({ ...input, schemaVersion: 1, id: input.id ?? randomUUID(), capturedAt: input.capturedAt ?? new Date().toISOString(), changeRevision: change.revision ?? 0, ...(change.contentRevision === undefined ? {} : { contentRevision: change.contentRevision }), artifactHash: fingerprint, verificationFingerprint: fingerprint, fingerprintVersion: 2, git, ...(source === undefined ? {} : { source }) });
     if (existing.some(item => item.id === record.id)) throw new Error(`Evidence ID already exists: ${record.id}`);
     // Rewrite under lock with atomic replacement to avoid partial concurrent appends.
     const temp = `${file}.${randomUUID()}.tmp`;
@@ -263,7 +282,7 @@ function defaultAttachmentKind(mediaType: string | undefined): EvidenceAttachmen
 export async function stageEvidenceAttachments(root: string, changeId: string, evidenceId: string, inputs: EvidenceAttachmentInput[]): Promise<EvidenceAttachment[]> {
   if (!/^[a-zA-Z0-9-]+$/.test(evidenceId)) throw new WorkflowError('invalid_evidence_id', `Invalid evidence ID: ${evidenceId}`, 'Use an alphanumeric or hyphenated evidence ID.');
   if (!inputs.length) return [];
-  const directory = path.join(changeDir(root, changeId), 'evidence', evidenceId);
+  const directory = path.join(await changeDir(root, changeId), 'evidence', evidenceId);
   await mkdir(directory, { recursive: true });
   const staged: EvidenceAttachment[] = [];
   let total = 0;
@@ -306,7 +325,7 @@ export async function evidenceAssetPath(root: string, changeId: string, relative
 
 /** Move verification logs referenced outside the change into archive-local evidence storage. */
 export async function archiveEvidenceArtifacts(root: string, changeId: string): Promise<{ records: number; relocated: string[]; missing: string[] }> {
-  const directory = changeDir(root, changeId);
+  const directory = await changeDir(root, changeId);
   const file = path.join(directory, 'evidence.jsonl');
   let records: EvidenceRecord[];
   try { records = await readEvidence(root, changeId); }
@@ -347,15 +366,25 @@ export async function evaluateEvidenceFreshness(root: string, changeId: string, 
   }
   const current = await inspectGitContext(root);
   if (!current.isRepository) {
-    // Without a repository the strict revision/artifact binding is the whole observation basis.
-    reasons.push('Git repository observation was unavailable; artifact binding was used.');
-    return { status: reasons.length > 1 ? 'stale' : 'fresh', basis: 'artifact', reasons, independentlyVerified: false };
+    if (!evidence.source) {
+      reasons.push('Recorded source fingerprint is unavailable (legacy evidence); freshness covers change artifacts only, so application source is unbound.');
+      return { status: reasons.length > 1 ? 'stale' : 'fresh', basis: 'artifact', sourceBound: false, reasons, independentlyVerified: false };
+    }
+    const unknownReasons: string[] = [];
+    if (evidence.source.truncated) {
+      unknownReasons.push('Recorded workspace source fingerprint was truncated; source observation is incomplete.');
+    } else {
+      const source = await fingerprintWorkspace(root);
+      if (source.truncated) unknownReasons.push('Workspace source fingerprint is truncated; source observation is incomplete.');
+      else if (source.digest !== evidence.source.digest) reasons.push('Workspace source fingerprint changed.');
+    }
+    return { status: reasons.length ? 'stale' : unknownReasons.length ? 'unknown' : 'fresh', basis: 'artifact', sourceBound: true, reasons: [...reasons, ...unknownReasons], independentlyVerified: false };
   }
   const unknownReasons: string[] = [];
   if (!evidence.git.isRepository) unknownReasons.push('Recorded Git observation is unavailable.');
   else if (current.tracked.truncated || current.untracked.truncated || evidence.git.tracked.truncated || evidence.git.untracked.truncated) unknownReasons.push('Git fingerprint was truncated; source observation is incomplete.');
   else if (current.repository.head !== evidence.git.repository.head || current.tracked.digest !== evidence.git.tracked.digest || current.untracked.digest !== evidence.git.untracked.digest) reasons.push('Git worktree or HEAD changed.');
-  return { status: reasons.length ? 'stale' : unknownReasons.length ? 'unknown' : 'fresh', basis: 'git', reasons: [...reasons, ...unknownReasons], independentlyVerified: false };
+  return { status: reasons.length ? 'stale' : unknownReasons.length ? 'unknown' : 'fresh', basis: 'git', sourceBound: true, reasons: [...reasons, ...unknownReasons], independentlyVerified: false };
 }
 
 /** Classify every declared check with one freshness policy shared by state, evidence output, and closure. */
@@ -385,6 +414,19 @@ export async function evaluateVerificationFacets(root: string, changeId: string,
   }
   const by = (status: CheckFacetStatus) => facets.filter(facet => facet.status === status).map(facet => facet.checkId);
   return { missing: by('missing'), failed: by('failed'), stale: by('stale'), unknown: by('unknown'), current: by('current'), independentlyVerified: false, checks: facets, records };
+}
+
+/** Summarize whether current evidence observes application source in addition to change artifacts. */
+export function summarizeSourceBinding(facets: VerificationFacets): SourceBindingSummary {
+  const current = facets.checks.filter(facet => facet.status === 'current' && facet.freshness);
+  const gitChecks = current.filter(facet => facet.freshness!.basis === 'git').length;
+  const workspaceChecks = current.filter(facet => facet.freshness!.basis === 'artifact' && facet.freshness!.sourceBound === true).length;
+  const unboundChecks = current.length - gitChecks - workspaceChecks;
+  const basis: SourceBindingSummary['basis'] = current.length === 0 ? 'none'
+    : gitChecks && (workspaceChecks || unboundChecks) ? 'mixed'
+    : gitChecks ? 'git'
+    : 'artifact';
+  return { basis, bound: current.length > 0 && unboundChecks === 0, currentChecks: current.length, gitChecks, workspaceChecks, unboundChecks };
 }
 
 /** Build a runnable recovery command from affected check IDs; it is never executed automatically. */

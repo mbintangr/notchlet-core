@@ -84,20 +84,42 @@ test('v1 ingestion rejects locally-observed provenance and never marks supplied 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('without Git, authored artifact edits stale evidence while derived views stay fresh', async () => {
+test('without Git, workspace source and authored artifacts both stale evidence', async () => {
   const { root, id } = await setup();
   try {
+    await writeFile(path.join(root, 'source.ts'), 'export const value = 1;\n');
     const evidence = await appendEvidence(root, id, input());
     const unchanged = await evaluateEvidenceFreshness(root, id, evidence);
     assert.equal(unchanged.status, 'fresh');
     assert.equal(unchanged.basis, 'artifact');
+    assert.equal(unchanged.sourceBound, true);
+    assert.deepEqual(unchanged.reasons, []);
     await writeFile(path.join(root, '.notchlet', 'changes', id, 'proposal.md'), '# edited derived view');
     assert.equal((await evaluateEvidenceFreshness(root, id, evidence)).status, 'fresh');
+    await writeFile(path.join(root, 'source.ts'), 'export const value = 2;\n');
+    const sourceEdited = await evaluateEvidenceFreshness(root, id, evidence);
+    assert.equal(sourceEdited.status, 'stale');
+    assert.equal(sourceEdited.sourceBound, true);
+    assert.match(sourceEdited.reasons.join(' '), /Workspace source fingerprint changed/);
+    await writeFile(path.join(root, 'source.ts'), 'export const value = 1;\n');
     await writeFile(path.join(root, '.notchlet', 'changes', id, 'design.md'), '# edited design');
     const edited = await evaluateEvidenceFreshness(root, id, evidence);
     assert.equal(edited.status, 'stale');
     assert.equal(edited.basis, 'artifact');
     assert.match(edited.reasons.join(' '), /Relevant change content/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('legacy non-Git evidence without a source fingerprint stays fresh but source-unbound', async () => {
+  const { root, id } = await setup();
+  try {
+    const evidence = await appendEvidence(root, id, input());
+    const { source: _source, ...legacy } = evidence;
+    const result = await evaluateEvidenceFreshness(root, id, legacy);
+    assert.equal(result.status, 'fresh');
+    assert.equal(result.sourceBound, false);
+    assert.match(result.reasons.join(' '), /Recorded source fingerprint is unavailable/);
+    assert.match(result.reasons.join(' '), /application source is unbound/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

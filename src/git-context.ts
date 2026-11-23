@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { lstat, readFile, readlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { isSourceExcluded } from './source-files.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_FILES = 20_000;
@@ -10,6 +11,7 @@ const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 
 export interface NormalizedRemote { host: string; owner: string; repo: string; }
+export interface NamedRemote extends NormalizedRemote { name: string; }
 export interface GitFingerprint { algorithm: 'sha256'; digest: string; files: number; bytesHashed: number; truncated: boolean; }
 export interface GitRepositoryIdentity {
   topLevel: string;
@@ -18,10 +20,16 @@ export interface GitRepositoryIdentity {
   isLinkedWorktree: boolean;
   branch: string | null;
   head: string | null;
+  /** Tree object for the recorded commit, when the repository has a commit. */
+  headTree: string | null;
   remotes: NormalizedRemote[];
+  /** Fetch remotes retained with their Git remote name; never includes credentials. */
+  remoteDetails: NamedRemote[];
+  /** The fetch remote named origin, when present. */
+  originRemote?: NormalizedRemote;
 }
 export type GitContextResult =
-  | { available: true; isRepository: true; repository: GitRepositoryIdentity; tracked: GitFingerprint; untracked: GitFingerprint }
+  | { available: true; isRepository: true; repository: GitRepositoryIdentity; tracked: GitFingerprint; untracked: GitFingerprint; dirty: boolean }
   | { available: true; isRepository: false; reason: 'not_a_repository' }
   | { available: false; isRepository: false; reason: 'git_unavailable' };
 
@@ -48,20 +56,10 @@ function normalizeRemote(input: string): NormalizedRemote | null {
   return { host: host.toLowerCase(), owner: parts.at(-2)!, repo: parts.at(-1)! };
 }
 
-function excluded(relative: string): boolean {
-  const normalized = relative.replace(/\\/g, '/').replace(/^\.\//, '');
-  const parts = normalized.split('/');
-  // Evidence is derived from the current change/Git view; hashing the evidence log itself
-  // would make every newly recorded item stale immediately after its own append.
-  return parts.at(-1) === 'evidence.jsonl' || parts.at(-1) === 'evidence.jsonl.lock' ||
-    parts.some((part, index) => part === '.git' || part === 'node_modules' || ['dist', 'build', 'coverage', 'out', '.next', '.turbo'].includes(part)) ||
-    parts.some(part => part.startsWith('.env')) || parts.some((part, index) => part === '.local' && parts[index - 1] === '.notchlet');
-}
-
 async function fingerprint(root: string, paths: string[]): Promise<GitFingerprint> {
   const hash = createHash('sha256');
-  let files = 0, bytesHashed = 0, truncated = paths.length > MAX_FILES;
-  const ordered = paths.filter(file => !excluded(file)).sort((a, b) => a.localeCompare(b, 'en'));
+  let files = 0, bytesHashed = 0, truncated = false;
+  const ordered = paths.filter(file => !isSourceExcluded(file)).sort((a, b) => a.localeCompare(b, 'en'));
   if (ordered.length > MAX_FILES) truncated = true;
   for (const relative of ordered.slice(0, MAX_FILES)) {
     const filePath = path.join(root, relative);
@@ -87,6 +85,15 @@ async function fingerprint(root: string, paths: string[]): Promise<GitFingerprin
 }
 
 /** Inspect Git identity and bounded content fingerprints without returning file contents or credential-bearing URLs. */
+/** Cheap repository probe for output that only discloses whether source changes are observed. */
+export async function detectObservationBasis(start = process.cwd()): Promise<'git' | 'artifact'> {
+  try {
+    const cwd = await realpath(path.resolve(start)).catch(() => path.resolve(start));
+    await git(cwd, 'rev-parse', '--show-toplevel');
+    return 'git';
+  } catch { return 'artifact'; }
+}
+
 export async function inspectGitContext(start = process.cwd()): Promise<GitContextResult> {
   const cwd = await realpath(path.resolve(start)).catch(() => path.resolve(start));
   try { await git(cwd, '--version'); }
@@ -98,11 +105,24 @@ export async function inspectGitContext(start = process.cwd()): Promise<GitConte
     const commonDir = await realpath(path.resolve(topLevel, commonRaw));
     const branch = await git(topLevel, 'branch', '--show-current') || null;
     const head = await git(topLevel, 'rev-parse', '--verify', 'HEAD').catch(() => null);
+    const headTree = head ? await git(topLevel, 'rev-parse', '--verify', `${head}^{tree}`).catch(() => null) : null;
     const remoteLines = (await git(topLevel, 'remote', '-v')).split(/\r?\n/);
-    const remotes = [...new Map(remoteLines.map(line => line.match(/^\S+\s+(.+?)\s+\(fetch\)$/)).filter(Boolean).map(match => normalizeRemote(match![1])).filter((value): value is NormalizedRemote => Boolean(value)).map(remote => [`${remote.host}/${remote.owner}/${remote.repo}`, remote])).values()].sort((a,b) => `${a.host}/${a.owner}/${a.repo}`.localeCompare(`${b.host}/${b.owner}/${b.repo}`));
+    const named = remoteLines.map(line => {
+      const match = line.match(/^(\S+)\s+(.+?)\s+\(fetch\)$/);
+      if (!match) return null;
+      const remote = normalizeRemote(match[2]);
+      return remote ? { name: match[1], ...remote } : null;
+    }).filter((value): value is NamedRemote => Boolean(value));
+    const remoteDetails = [...new Map(named.map(remote => [`${remote.name}\0${remote.host}/${remote.owner}/${remote.repo}`, remote])).values()]
+      .sort((a, b) => `${a.name}/${a.host}/${a.owner}/${a.repo}`.localeCompare(`${b.name}/${b.host}/${b.owner}/${b.repo}`));
+    const remotes = [...new Map(remoteDetails.map(remote => [`${remote.host}/${remote.owner}/${remote.repo}`, { host: remote.host, owner: remote.owner, repo: remote.repo }])).values()]
+      .sort((a, b) => `${a.host}/${a.owner}/${a.repo}`.localeCompare(`${b.host}/${b.owner}/${b.repo}`));
+    const originRemote = remoteDetails.find(remote => remote.name === 'origin');
     const trackedPaths = (await git(topLevel, 'ls-files', '-z')).split('\0').filter(Boolean);
     const untrackedPaths = (await git(topLevel, 'ls-files', '--others', '--exclude-standard', '-z')).split('\0').filter(file => Boolean(file) && !/evidence\.jsonl(?:\.lock)?$/.test(file.replace(/\\/g, '/')));
-    return { available: true, isRepository: true, repository: { topLevel, gitDir, commonDir, isLinkedWorktree: gitDir !== commonDir, branch, head, remotes }, tracked: await fingerprint(topLevel, trackedPaths), untracked: await fingerprint(topLevel, untrackedPaths) };
+    const status = await git(topLevel, 'status', '--porcelain=v1', '-z', '--untracked-files=normal', '--no-renames').catch(() => '');
+    const dirty = status.split('\0').filter(Boolean).some(entry => !isSourceExcluded(entry.slice(3)));
+    return { available: true, isRepository: true, repository: { topLevel, gitDir, commonDir, isLinkedWorktree: gitDir !== commonDir, branch, head, headTree, remotes, remoteDetails, ...(originRemote === undefined ? {} : { originRemote: { host: originRemote.host, owner: originRemote.owner, repo: originRemote.repo } }) }, tracked: await fingerprint(topLevel, trackedPaths), untracked: await fingerprint(topLevel, untrackedPaths), dirty };
   } catch (error) {
     const message = (error as NodeJS.ErrnoException).message ?? '';
     if (/not a git repository/i.test(message) || (error as NodeJS.ErrnoException).code === 'ENOENT') return { available: true, isRepository: false, reason: 'not_a_repository' };

@@ -24,6 +24,8 @@ test('fingerprints tracked and applicable untracked content, excluding ignored a
   try {
     const clean = await inspectGitContext(root); assert.equal(clean.isRepository, true);
     if (!clean.isRepository) return;
+    assert.equal(clean.dirty, false);
+    assert.match(clean.repository.headTree ?? '', /^[a-f0-9]{40}$/);
     await writeFile(path.join(root, '.gitignore'), '.env\nignored.txt\nnode_modules/\n');
     await writeFile(path.join(root, '.env'), 'TOP SECRET'); await writeFile(path.join(root, 'ignored.txt'), 'secret');
     await mkdir(path.join(root, 'node_modules'), { recursive: true }); await writeFile(path.join(root, 'node_modules', 'x'), 'secret');
@@ -34,6 +36,7 @@ test('fingerprints tracked and applicable untracked content, excluding ignored a
     assert.equal(dirty.untracked.files, 2); // .gitignore and new.txt
     assert(!JSON.stringify(dirty).includes('TOP SECRET'));
     assert.notEqual(dirty.untracked.digest, clean.untracked.digest);
+    assert.equal(dirty.dirty, true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -60,8 +63,46 @@ test('normalizes SSH and HTTPS remotes and strips credentials', async () => {
     const result = await inspectGitContext(root); assert(result.isRepository);
     if (result.isRepository) {
       assert.deepEqual(result.repository.remotes, [{ host: 'github.com', owner: 'team', repo: 'project' }, { host: 'gitlab.example', owner: 'group', repo: 'repo' }]);
+      assert.deepEqual(result.repository.remoteDetails, [{ name: 'https', host: 'gitlab.example', owner: 'group', repo: 'repo' }, { name: 'ssh', host: 'github.com', owner: 'team', repo: 'project' }]);
+      assert.deepEqual(result.repository.originRemote, undefined);
       assert(!JSON.stringify(result).match(/alice|secret|hidden/));
     }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('retains the origin remote name without retaining credentials', async () => {
+  const root = await repo();
+  try {
+    await run(root, 'remote', 'add', 'origin', 'https://alice:secret@github.com/team/project.git');
+    const result = await inspectGitContext(root); assert(result.isRepository);
+    if (result.isRepository) {
+      assert.deepEqual(result.repository.originRemote, { host: 'github.com', owner: 'team', repo: 'project' });
+      assert.deepEqual(result.repository.remoteDetails, [{ name: 'origin', host: 'github.com', owner: 'team', repo: 'project' }]);
+      assert(!JSON.stringify(result).match(/alice|secret/));
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('excludes tracked credentials and workspace metadata from fingerprints and dirty status', async () => {
+  const root = await repo();
+  try {
+    await writeFile(path.join(root, 'credentials.json'), '{"token":"secret"}');
+    await mkdir(path.join(root, '.notchlet', 'changes', 'demo'), { recursive: true });
+    await writeFile(path.join(root, '.notchlet', 'changes', 'demo', 'tasks.json'), '{}');
+    await run(root, 'add', 'credentials.json'); await run(root, 'commit', '-m', 'credentials');
+    const clean = await inspectGitContext(root); assert(clean.isRepository);
+    if (!clean.isRepository) return;
+    assert.equal(clean.dirty, false);
+
+    await writeFile(path.join(root, 'credentials.json'), '{"token":"changed"}');
+    await writeFile(path.join(root, '.env'), 'CHANGED');
+    await writeFile(path.join(root, '.notchlet', 'changes', 'demo', 'tasks.json'), '{"changed":true}');
+    const after = await inspectGitContext(root); assert(after.isRepository);
+    if (!after.isRepository) return;
+    assert.equal(after.tracked.digest, clean.tracked.digest);
+    assert.equal(after.untracked.digest, clean.untracked.digest);
+    assert.equal(after.dirty, false);
+    assert(!JSON.stringify(after).includes('changed'));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

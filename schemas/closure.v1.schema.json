@@ -56,6 +56,38 @@
         "checkedAt": { "type": "string", "format": "date-time" }
       }
     },
+    "rollup": {
+      "type": "object",
+      "required": ["children"],
+      "properties": {
+        "children": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["changeId", "relativePath", "closedAt", "closureSha256", "contribution", "verification"],
+            "properties": {
+              "changeId": { "type": "string", "minLength": 1 },
+              "relativePath": { "type": "string", "minLength": 1 },
+              "closedAt": { "type": "string", "format": "date-time" },
+              "closureSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "contribution": { "enum": ["none", "delta", "standard"] },
+              "verification": {
+                "type": "object",
+                "required": ["status", "basis"],
+                "properties": {
+                  "status": { "enum": ["not_applicable", "missing", "failed", "stale", "unknown", "current"] },
+                  "basis": { "enum": ["git", "artifact", "mixed", "none"] },
+                  "evidenceId": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "evidence": {
       "type": "object",
       "required": ["records", "current", "superseded", "attachments", "items", "logs"],

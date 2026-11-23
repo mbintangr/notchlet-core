@@ -219,12 +219,53 @@ test('quick no-impact change closes in a non-Git workspace without a capability 
     assert.deepEqual(preview.blockers, []);
     assert.equal(preview.verification.basis, 'artifact');
     assert.equal(preview.verification.status, 'current');
+    assert.equal(preview.sourceBinding.bound, true);
+    assert.equal(preview.sourceBinding.workspaceChecks, 1);
     const closed = await closeChange(root, initial.id, {});
     assert.equal(closed.archived, true);
     assert.equal(closed.baselineRevision, undefined);
+    const manifest = JSON.parse(await readFile(path.join(root, '.notchlet', 'archive', initial.id, 'closure.json'), 'utf8'));
+    assert.equal(manifest.sourceBinding.bound, true);
+    assert.equal(manifest.sourceBinding.acceptedArtifactBasis, false);
+    assert.equal(manifest.verification.sourceBound, true);
     await access(path.join(root, '.notchlet', 'archive', initial.id, 'tasks.json'));
     assert.equal(await readFile(path.join(capabilities, 'other.yaml'), 'utf8'), preserved);
     await assert.rejects(access(path.join(capabilities, `${initial.id}.yaml`)));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('non-Git legacy evidence blocks closure until the artifact basis is acknowledged', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'notchlet-unbound-'));
+  try {
+    await initWorkspace(root);
+    const initial = await scaffold(root, 'Unbound evidence', 'quick');
+    const change: Change = {
+      ...initial, intent: 'Maintain behavior', outcome: 'Behavior remains', capabilityImpact: 'none', capabilityRationale: 'Documentation-only maintenance with no durable behavior change.',
+      requirements: [req], checks: [{ id: 'CHECK-1', description: 'Run acceptance check' }],
+      tasks: [{ id: 'TASK-1', title: 'Complete work', status: 'completed', dependencies: [], requirementIds: ['REQ-BASE'] }],
+      revision: 1,
+    };
+    await writeFile(path.join(root, '.notchlet', 'changes', initial.id, 'tasks.json'), JSON.stringify(change));
+    await writeChangeArtifacts(root, initial.id);
+    const evidence = await appendEvidence(root, initial.id, { kind: 'check', outcome: 'passed', summary: 'Acceptance check passed', requirementIds: ['REQ-BASE'], taskIds: ['TASK-1'], checkIds: ['CHECK-1'], provenance: 'recorded' });
+    const { source: _source, ...legacy } = evidence;
+    await writeFile(path.join(root, '.notchlet', 'changes', initial.id, 'evidence.jsonl'), `${JSON.stringify(legacy)}\n`);
+
+    const preview = await previewCapabilityClose(root, initial.id);
+    assert.equal(preview.verification.status, 'current');
+    assert.equal(preview.sourceBinding.bound, false);
+    assert.equal(preview.sourceBinding.unboundChecks, 1);
+    const blocker = preview.blockers.find(item => item.code === 'artifact_basis_unacknowledged');
+    assert(blocker);
+    assert.match(blocker.recovery, /--accept-artifact-basis/);
+    await assert.rejects(closeChange(root, initial.id, {}), (error: unknown) => (error as { code?: string }).code === 'closure_blocked');
+
+    const closed = await closeChange(root, initial.id, { acceptArtifactBasis: true });
+    assert.equal(closed.archived, true);
+    const manifest = JSON.parse(await readFile(path.join(root, '.notchlet', 'archive', initial.id, 'closure.json'), 'utf8'));
+    assert.equal(manifest.sourceBinding.bound, false);
+    assert.equal(manifest.sourceBinding.acceptedArtifactBasis, true);
+    assert.equal(manifest.verification.sourceBound, false);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

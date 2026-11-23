@@ -1,13 +1,25 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { taskEvidenceStatus, type VerificationFacets } from './evidence.js';
-import { mkdir, readFile, rename, rm, stat, writeFile, mkdtemp, readdir, access } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile, mkdtemp, access } from 'node:fs/promises';
 import path from 'node:path';
-export { inspectGitContext } from './git-context.js';
-export type { GitContextResult, GitFingerprint, GitRepositoryIdentity, NormalizedRemote } from './git-context.js';
-export { appendEvidence, archiveEvidenceArtifacts, evaluateEvidenceFreshness, evaluateVerificationFacets, evidenceAssetPath, evidenceRecovery, inspectEvidence, parseEvidenceRecord, readEvidence, resolveEvidenceScope, stageEvidenceAttachments, taskEvidenceStatus, verificationRecovery } from './evidence.js';
-export type { CheckFacet, CheckFacetStatus, EvidenceAttachment, EvidenceAttachmentInput, EvidenceAttachmentKind, EvidenceCapture, EvidenceEnvironment, EvidenceFilter, EvidenceFreshness, EvidenceKind, EvidenceListing, EvidenceOutcome, EvidenceProvenance, EvidenceRecord, EvidenceScope, EvidenceScopeInput, EvidenceWriteInput, SetupPreflightEnvironment, TaskEvidenceStatus, VerificationFacets } from './evidence.js';
-export { closeChange, captureCapabilityBaseline, previewCapabilityClose, recoverCapabilityClose, renderClosureMarkdown } from './closure.js';
-export type { CapabilityBaseline, CapabilityEntry, CapabilityPreview, ClosureBlocker, ClosureManifest, ClosureManifestArtifact, CloseInterruptionPoint, CloseOptions } from './closure.js';
+import { WorkflowError } from './errors.js';
+import { stableId } from './ids.js';
+import { canParent, emptyBacklogSidecar, readBacklogSidecar, type BacklogItemType, type BacklogSidecar } from './backlog.js';
+import { changeDirectoryFor, changeRefHash, composeNodeDirectory, directoryForRelative, mergeMoveDirectory, resolveChangeLocation, scanChangeDirectories, uniqueNodeDirectory, workspaceRootForChangeFile, MAX_CHANGE_DEPTH, MAX_CHANGE_RELATIVE_PATH } from './paths.js';
+export { WorkflowError } from './errors.js';
+export { stableId } from './ids.js';
+export { atomicWriteJson, changeRefHash, composeNodeDirectory, directoryForRelative, mergedLocation, normalizeRelativePath, sanitizePathSegment, scanChangeDirectories, resolveChangeLocation, uniqueNodeDirectory, validateChangeRef, validatePathSegment, workspaceRootForChangeFile } from './paths.js';
+export type { ChangeDirectoryEntry, ChangeLocation, ChangeScope, ChangeScopeOption } from './paths.js';
+export * from './backlog.js';
+export * from './tree.js';
+export { detectObservationBasis, inspectGitContext } from './git-context.js';
+export type { GitContextResult, GitFingerprint, GitRepositoryIdentity, NamedRemote, NormalizedRemote } from './git-context.js';
+export { appendEvidence, archiveEvidenceArtifacts, evaluateEvidenceFreshness, evaluateVerificationFacets, evidenceAssetPath, evidenceRecovery, inspectEvidence, parseEvidenceRecord, readEvidence, resolveEvidenceScope, stageEvidenceAttachments, summarizeSourceBinding, taskEvidenceStatus, verificationRecovery } from './evidence.js';
+export type { CheckFacet, CheckFacetStatus, EvidenceAttachment, EvidenceAttachmentInput, EvidenceAttachmentKind, EvidenceCapture, EvidenceEnvironment, EvidenceFilter, EvidenceFreshness, EvidenceKind, EvidenceListing, EvidenceOutcome, EvidenceProvenance, EvidenceRecord, EvidenceScope, EvidenceScopeInput, EvidenceWriteInput, SetupPreflightEnvironment, SourceBindingSummary, TaskEvidenceStatus, VerificationFacets } from './evidence.js';
+export { fingerprintWorkspace, isSourceExcluded } from './source-files.js';
+export type { WorkspaceFingerprint } from './source-files.js';
+export { closeChange, captureCapabilityBaseline, inspectClosureIntegrity, previewCapabilityClose, recoverCapabilityClose, renderClosureMarkdown } from './closure.js';
+export type { CapabilityBaseline, CapabilityEntry, CapabilityPreview, ClosureBlocker, ClosureIntegrityIssue, ClosureIntegrityIssueCode, ClosureIntegrityReport, ClosureManifest, ClosureManifestArtifact, CloseInterruptionPoint, CloseOptions, RollupDescendantCounts } from './closure.js';
 export { listSchemas, readSchema, schemaDirectory } from './schemas.js';
 export type { SchemaListing } from './schemas.js';
 
@@ -90,6 +102,10 @@ export interface Check {
   expectedTitle?: string;
   /** Selectors that must be present and perceptible (not hidden, zero-size, or fully transparent). */
   expectedVisibleSelectors?: string[];
+  /** Selectors that must not be perceptible; absent or hidden both pass. */
+  expectedHiddenSelectors?: string[];
+  /** Selectors that must be absent from the DOM; present-but-hidden fails. */
+  expectedAbsentSelectors?: string[];
   /** Selectors that must be present and enabled (no disabled or aria-disabled state). */
   expectedEnabledSelectors?: string[];
   /** Text that must appear inside a named container, proving the intended view rendered. */
@@ -163,10 +179,6 @@ export interface Evidence { schemaVersion: 1; id: string; kind: string; summary:
 export interface Instruction { schemaVersion: 1; changeId: string; generatedAt: string; body: string; taskIds: string[]; }
 export interface CliError { code: string; message: string; recovery: string; }
 export interface CliJsonEnvelope { protocolVersion: 1; command: string; ok: boolean; data: unknown; error: CliError | null; warnings: unknown[]; }
-
-export class WorkflowError extends Error {
-  constructor(public readonly code: string, message: string, public readonly recovery: string) { super(message); this.name = 'WorkflowError'; }
-}
 
 type JsonRecord = Record<string, unknown>;
 const sentence = (value: string): string => value.trim().replace(/[.!?]+$/, '');
@@ -422,12 +434,14 @@ function capturePolicy(value: JsonRecord, key: string, label: string): UiCapture
 
 function parseCheckValue(value: unknown): Check {
   if (!record(value)) schemaError('check must be an object.');
-  exactKeys(value, ['id', 'description', 'kind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'], ['id', 'description'], 'check');
+  exactKeys(value, ['id', 'description', 'kind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedHiddenSelectors', 'expectedAbsentSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'], ['id', 'description'], 'check');
   const requirementIds = optionalUniqueStrings(value, 'requirementIds', 'check');
   const scenarioIds = optionalUniqueStrings(value, 'scenarioIds', 'check');
   const taskIds = optionalUniqueStrings(value, 'taskIds', 'check');
   const expectedSelectors = optionalUniqueStrings(value, 'expectedSelectors', 'check');
   const expectedVisibleSelectors = optionalUniqueStrings(value, 'expectedVisibleSelectors', 'check');
+  const expectedHiddenSelectors = optionalUniqueStrings(value, 'expectedHiddenSelectors', 'check');
+  const expectedAbsentSelectors = optionalUniqueStrings(value, 'expectedAbsentSelectors', 'check');
   const expectedEnabledSelectors = optionalUniqueStrings(value, 'expectedEnabledSelectors', 'check');
   const expectedScopedText = scopedTextExpectations(value, 'expectedScopedText', 'check');
   const steps = uiSteps(value, 'steps', 'check');
@@ -464,6 +478,8 @@ function parseCheckValue(value: unknown): Check {
     ...(value.expectedText === undefined ? {} : { expectedText: stringField(value, 'expectedText', 'check') }),
     ...(value.expectedTitle === undefined ? {} : { expectedTitle: stringField(value, 'expectedTitle', 'check') }),
     ...(expectedVisibleSelectors === undefined ? {} : { expectedVisibleSelectors }),
+    ...(expectedHiddenSelectors === undefined ? {} : { expectedHiddenSelectors }),
+    ...(expectedAbsentSelectors === undefined ? {} : { expectedAbsentSelectors }),
     ...(expectedEnabledSelectors === undefined ? {} : { expectedEnabledSelectors }),
     ...(expectedScopedText === undefined ? {} : { expectedScopedText }),
     ...(steps === undefined ? {} : { steps }),
@@ -584,11 +600,6 @@ export function parseCliJsonEnvelope(input: unknown): CliJsonEnvelope {
   return { protocolVersion: 1, command: input.command, ok: input.ok, data: input.data, error, warnings: input.warnings };
 }
 
-export function stableId(value: string): string {
-  const slug = value.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40).replace(/-$/g, '');
-  return slug || 'change';
-}
-
 export async function findWorkspace(start = process.cwd(), explicitRoot?: string): Promise<string | null> {
   if (explicitRoot !== undefined) {
     const candidate = path.resolve(explicitRoot);
@@ -639,17 +650,17 @@ export function withMarkdownArtifacts(change: Change): Change {
   return { ...change, artifacts };
 }
 
-export async function scaffold(root: string, name: string, mode: 'quick' | 'standard' = 'standard'): Promise<Change> {
-  const id = stableId(name);
-  const changes = path.join(root, WORKSPACE, 'changes');
+async function scaffoldAt(root: string, relativePath: string, name: string, mode: 'quick' | 'standard', extra: Partial<Change> = {}, sidecar?: BacklogSidecar): Promise<Change> {
+  const id = relativePath.split('/').pop()!;
   try { await stat(path.join(root, WORKSPACE, 'workspace.json')); } catch { throw new WorkflowError('setup_required', 'No initialized Notchlet workspace was found.', 'Run `notchlet init` in the project root.'); }
-  const dir = path.join(changes, id);
-  const exists = (): never => { throw new WorkflowError('change_exists', `Change already exists: ${id}`, 'Choose a different change name or inspect the existing change.'); };
+  const changes = path.join(root, WORKSPACE, 'changes');
+  const dir = directoryForRelative(root, 'active', relativePath);
+  const exists = (): never => { throw new WorkflowError('change_exists', `Change already exists: ${relativePath}`, 'Choose a different change name or inspect the existing change.'); };
   try { await stat(dir); exists(); }
   catch (error) { if (error instanceof WorkflowError) throw error; if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   const stage = await mkdtemp(path.join(changes, '.staging-'));
   const artifacts = CORE_ARTIFACTS[mode];
-  const content: Change = withExecutionSha256({ schemaVersion: CHANGE_SCHEMA_VERSION, id, name, createdAt: new Date().toISOString(), mode, intent: '', outcome: '', requirements: [], acceptanceScenarios: [], designDecisions: [], checks: [], tasks: [], artifacts: Object.fromEntries(artifacts.map(a => [a, a])), revision: 0, contentRevision: 0 });
+  const content: Change = withExecutionSha256({ schemaVersion: CHANGE_SCHEMA_VERSION, id, name, createdAt: new Date().toISOString(), mode, intent: '', outcome: '', requirements: [], acceptanceScenarios: [], designDecisions: [], checks: [], tasks: [], artifacts: Object.fromEntries(artifacts.map(a => [a, a])), revision: 0, contentRevision: 0, ...extra });
   try {
     const rendered = new Map(renderChangeArtifacts(content).map(item => [item.artifact, item.content]));
     for (const artifact of artifacts) {
@@ -658,6 +669,8 @@ export async function scaffold(root: string, name: string, mode: 'quick' | 'stan
         : rendered.get(artifact as RenderedArtifactName) ?? `# ${name}\n\n<!-- Fill in design decisions before validation. -->\n\n## Design\n\n`;
       await writeFile(path.join(stage, artifact), text, { flag: 'wx' });
     }
+    if (sidecar) await writeFile(path.join(stage, 'backlog.json'), JSON.stringify(sidecar, null, 2) + '\n', { flag: 'wx' });
+    await mkdir(path.dirname(dir), { recursive: true });
     try { await rename(stage, dir); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -670,19 +683,80 @@ export async function scaffold(root: string, name: string, mode: 'quick' | 'stan
   return content;
 }
 
+export async function scaffold(root: string, name: string, mode: 'quick' | 'standard' = 'standard'): Promise<Change> {
+  return scaffoldAt(root, stableId(name), name, mode);
+}
+
+export interface NodeScaffoldInput {
+  name: string;
+  itemType: BacklogItemType;
+  parent?: string;
+  title?: string;
+  slug?: string;
+  mode?: 'quick' | 'standard';
+  productId?: string;
+  lastWriter?: string;
+}
+
+export interface NodeScaffoldResult {
+  change: Change;
+  relativePath: string;
+  directory: string;
+  backlog: BacklogSidecar;
+}
+
+/** Scaffold one backlog node as a full change, nesting it under an existing parent when provided. */
+export async function scaffoldNode(root: string, input: NodeScaffoldInput): Promise<NodeScaffoldResult> {
+  let parentRelativePath: string | undefined;
+  let parentType: BacklogItemType | undefined;
+  if (input.parent) {
+    const parent = await resolveChangeLocation(root, input.parent, { scope: 'active' });
+    parentRelativePath = parent.relativePath;
+    const parentBacklog = await readBacklogSidecar(parent.directory);
+    if (!parentBacklog) {
+      throw new WorkflowError('invalid_node_type', `Parent ${parent.relativePath} has no backlog.json sidecar, so its backlog type is unknown.`, 'Convert the parent to a backlog node before nesting children under it.');
+    }
+    parentType = parentBacklog.node.itemType;
+    if (!canParent(parentType, input.itemType)) {
+      throw new WorkflowError('invalid_node_type', `${input.itemType} cannot be a child of ${parentType} (${parent.relativePath}); backlog types must nest EPIC > STORY > TASK > SUBTASK.`, `Use --as ${parentType === 'EPIC' ? 'story' : parentType === 'STORY' ? 'task' : 'subtask'} under ${parent.relativePath}.`);
+    }
+  }
+  const title = input.title?.trim() || input.name;
+  const slug = input.slug?.trim() || stableId(title);
+  const relativePath = await uniqueNodeDirectory(root, composeNodeDirectory({ slug, ...(parentRelativePath === undefined ? {} : { parentRelativePath }) }));
+  const mode = input.mode ?? 'quick';
+  const sidecar = emptyBacklogSidecar({
+    itemType: input.itemType,
+    title,
+    slug: stableId(slug),
+    origin: 'local',
+    ...(input.productId === undefined ? {} : { productId: input.productId }),
+    ...(input.lastWriter === undefined ? {} : { lastWriter: input.lastWriter }),
+  });
+  const extra: Partial<Change> = {
+    ...(input.itemType === 'EPIC' || input.itemType === 'STORY'
+      ? {
+        intent: `Coordinate ${title}: deliver the child changes as one backlog unit.`,
+        outcome: `${title} is complete when its child changes are verified and closed.`,
+      }
+      : {}),
+    ...(mode === 'quick'
+      ? { capabilityImpact: 'none' as const, capabilityRationale: 'Backlog node; capability deltas are declared by the leaf change that changes behavior.' }
+      : {}),
+  };
+  const change = await scaffoldAt(root, relativePath, title, mode, extra, sidecar);
+  return { change, relativePath, directory: directoryForRelative(root, 'active', relativePath), backlog: sidecar };
+}
+
 export function convertChange(change: Change, mode: 'quick' | 'standard'): Change {
   const artifacts = { ...change.artifacts };
   for (const artifact of CORE_ARTIFACTS[mode]) artifacts[artifact] ??= artifact;
   return { ...change, mode, artifacts };
 }
 
-function changeDirectory(root: string, id: string): string {
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) throw new WorkflowError('invalid_change_id', `Invalid change ID: ${id}`, 'Use a change ID returned by `notchlet change list`.');
-  return path.join(path.resolve(root), WORKSPACE, 'changes', id);
-}
-
 export async function readChange(root: string, id: string): Promise<Change> {
-  const file = path.join(changeDirectory(root, id), 'tasks.json');
+  const directory = await changeDirectoryFor(root, id);
+  const file = path.join(directory, 'tasks.json');
   try { return parseChange(await readFile(file, 'utf8')); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new WorkflowError('change_not_found', `Change not found: ${id}`, 'List changes with `notchlet change list` and use an existing change ID.');
@@ -690,31 +764,27 @@ export async function readChange(root: string, id: string): Promise<Change> {
   }
 }
 
-export interface ChangeSummary { id: string; name: string; mode: Change['mode']; taskCount: number; completedTaskCount: number; ready: boolean; }
+export interface ChangeSummary { id: string; name: string; mode: Change['mode']; taskCount: number; completedTaskCount: number; ready: boolean; relativePath?: string; rollup?: boolean; }
 export async function listChanges(root: string): Promise<ChangeSummary[]> {
-  let entries;
-  try { entries = await readdir(path.join(path.resolve(root), WORKSPACE, 'changes'), { withFileTypes: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  const entries = await scanChangeDirectories(root, { scope: 'active' });
+  const allEntries = await scanChangeDirectories(root, { scope: 'merged' });
   const results: ChangeSummary[] = [];
-  for (const entry of entries.filter(item => item.isDirectory() && !item.name.startsWith('.')).sort((a, b) => a.name.localeCompare(b.name))) {
-    const change = await readChange(root, entry.name);
+  for (const entry of entries) {
+    const change = await readChange(root, entry.relativePath);
     const contents: Record<string, string> = {};
     for (const relative of Object.values(change.artifacts)) {
-      try { contents[relative] = await readFile(path.join(root, WORKSPACE, 'changes', entry.name, relative), 'utf8'); }
+      try { contents[relative] = await readFile(path.join(entry.directory, relative), 'utf8'); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
-    results.push({ id: change.id, name: change.name, mode: change.mode, taskCount: change.tasks.length, completedTaskCount: change.tasks.filter(task => task.status === 'completed').length, ready: readiness(change, contents).ready });
+    const rollup = allEntries.some(candidate => candidate.relativePath.startsWith(`${entry.relativePath}/`));
+    results.push({ id: change.id, name: change.name, mode: change.mode, taskCount: change.tasks.length, completedTaskCount: change.tasks.filter(task => task.status === 'completed').length, ready: readiness(change, contents, [], { rollup }).ready, relativePath: entry.relativePath, rollup });
   }
   return results;
 }
 
-function archiveDirectory(root: string, id: string): string {
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) throw new WorkflowError('invalid_change_id', `Invalid change ID: ${id}`, 'Use a change ID returned by `notchlet change list`.');
-  return path.join(path.resolve(root), WORKSPACE, 'archive', id);
-}
-
 export async function readArchivedChange(root: string, id: string): Promise<Change> {
-  const file = path.join(archiveDirectory(root, id), 'tasks.json');
+  const location = await resolveChangeLocation(root, id, { scope: 'archive' });
+  const file = path.join(location.directory, 'tasks.json');
   try { return parseChange(await readFile(file, 'utf8')); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new WorkflowError('change_not_found', `Archived change not found: ${id}`, 'List archived changes with `notchlet change list --archived`.');
@@ -731,21 +801,19 @@ export interface ArchivedChangeSummary extends ChangeSummary {
 }
 
 export async function listArchivedChanges(root: string): Promise<ArchivedChangeSummary[]> {
-  let entries;
-  try { entries = await readdir(path.join(path.resolve(root), WORKSPACE, 'archive'), { withFileTypes: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  const entries = await scanChangeDirectories(root, { scope: 'archive' });
   const results: ArchivedChangeSummary[] = [];
-  for (const entry of entries.filter(item => item.isDirectory() && !item.name.startsWith('.')).sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries) {
     let change: Change;
-    try { change = await readArchivedChange(root, entry.name); }
+    try { change = await readArchivedChange(root, entry.relativePath); }
     catch (error) { if (error instanceof WorkflowError) continue; throw error; }
     let closure: Record<string, unknown> | undefined;
-    try { closure = JSON.parse(await readFile(path.join(archiveDirectory(root, entry.name), 'closure.json'), 'utf8')) as Record<string, unknown>; }
+    try { closure = JSON.parse(await readFile(path.join(entry.directory, 'closure.json'), 'utf8')) as Record<string, unknown>; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     results.push({
       id: change.id, name: change.name, mode: change.mode,
       taskCount: change.tasks.length, completedTaskCount: change.tasks.filter(task => task.status === 'completed').length,
-      ready: true, archived: true,
+      ready: true, archived: true, relativePath: entry.relativePath,
       ...(typeof closure?.closedAt === 'string' ? { closedAt: closure.closedAt } : {}),
       ...(typeof closure?.contribution === 'string' ? { contribution: closure.contribution } : {}),
       ...(typeof (closure?.verification as Record<string, unknown> | undefined)?.status === 'string' ? { verificationStatus: (closure!.verification as Record<string, string>).status } : {}),
@@ -756,27 +824,42 @@ export async function listArchivedChanges(root: string): Promise<ArchivedChangeS
 }
 
 export async function restoreChange(root: string, id: string): Promise<Change> {
-  const active = changeDirectory(root, id);
-  const archived = archiveDirectory(root, id);
+  const archived = await resolveChangeLocation(root, id, { scope: 'archive' });
+  const [activeEntries, archivedEntries] = await Promise.all([
+    scanChangeDirectories(root, { scope: 'active' }),
+    scanChangeDirectories(root, { scope: 'archive' }),
+  ]);
+  const activePaths = new Set(activeEntries.map(entry => entry.relativePath));
+  const archivedPaths = new Set(archivedEntries.map(entry => entry.relativePath));
+  const segments = archived.relativePath.split('/');
+  const archivedAncestors = segments.slice(0, -1)
+    .map((_, index) => segments.slice(0, index + 1).join('/'))
+    .filter(ancestor => archivedPaths.has(ancestor) && !activePaths.has(ancestor));
+  if (archivedAncestors.length) {
+    const top = archivedAncestors[0];
+    throw new WorkflowError(
+      'parent_restore_required',
+      `Cannot restore ${archived.relativePath} while ancestor ${archivedAncestors.at(-1)} is still archived.`,
+      `Restore the top archived ancestor first; it moves the whole subtree: notchlet change restore ${top}. Then retry restoring ${archived.relativePath}.`,
+    );
+  }
+  const active = path.join(path.resolve(root), WORKSPACE, 'changes', ...archived.relativePath.split('/'));
   try {
     await access(path.join(active, 'tasks.json'));
     throw new WorkflowError('change_exists', `Change ${id} already exists in the active workspace.`, 'Close or rename the active change before restoring the archived copy.');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  try { await access(path.join(archived, 'tasks.json')); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new WorkflowError('archived_change_not_found', `Archived change not found: ${id}`, 'List archived changes with `notchlet change list --archived`.');
-    throw error;
-  }
   await mkdir(path.dirname(active), { recursive: true });
-  await rename(archived, active);
-  await rm(path.join(path.resolve(root), WORKSPACE, '.local', 'close', `${id}.json`), { force: true });
-  return readChange(root, id);
+  await mergeMoveDirectory(archived.directory, active);
+  const journalDirectory = path.join(path.resolve(root), WORKSPACE, '.local', 'close');
+  if (archived.relativePath.includes('/')) await rm(path.join(journalDirectory, `${changeRefHash(archived.relativePath)}.json`), { force: true });
+  else await rm(path.join(journalDirectory, `${archived.id}.json`), { force: true });
+  return readChange(root, archived.relativePath);
 }
 
 export async function persistConversion(root: string, id: string, mode: 'quick' | 'standard', options: { expectedRevision?: number } = {}): Promise<Change> {
-  const dir = changeDirectory(root, id);
+  const dir = await changeDirectoryFor(root, id);
   const file = path.join(dir, 'tasks.json');
   const release = await lock(file);
   try {
@@ -826,8 +909,8 @@ export function validateChangeStructure(change: Change): Issue[] {
     if (!check.id?.trim() || !check.description?.trim()) issue('invalid_check', 'Checks need an ID and description.');
     if ((check.kind === 'browser' || check.kind === 'http' || check.kind === 'ui') && !check.url?.trim()) issue('check_url_missing', `${check.kind} check ${check.id} requires a URL.`);
     if (check.kind === 'command' && !check.command?.trim()) issue('check_command_missing', `Command check ${check.id} requires a command.`);
-    if ((check.expectedBodyContains !== undefined || check.expectedJson !== undefined || check.expectedJsonContains !== undefined || check.expectedJsonAt !== undefined || check.expectedHeaders !== undefined || check.waitFor !== undefined || check.settleMs !== undefined || check.expectedSelectors !== undefined || check.expectedText !== undefined || check.expectedTitle !== undefined || check.expectedVisibleSelectors !== undefined || check.expectedEnabledSelectors !== undefined || check.expectedScopedText !== undefined || check.steps !== undefined || check.captureArtifacts !== undefined || check.expectedNoConsoleErrors !== undefined || check.fullPage !== undefined) && check.url === undefined) issue('check_url_missing', `Check ${check.id} declares URL assertions but no URL.`);
-    const uiOnlyFields = check.expectedTitle !== undefined || check.expectedVisibleSelectors !== undefined || check.expectedEnabledSelectors !== undefined || check.expectedScopedText !== undefined || check.steps !== undefined || check.captureArtifacts !== undefined;
+    if ((check.expectedBodyContains !== undefined || check.expectedJson !== undefined || check.expectedJsonContains !== undefined || check.expectedJsonAt !== undefined || check.expectedHeaders !== undefined || check.waitFor !== undefined || check.settleMs !== undefined || check.expectedSelectors !== undefined || check.expectedText !== undefined || check.expectedTitle !== undefined || check.expectedVisibleSelectors !== undefined || check.expectedHiddenSelectors !== undefined || check.expectedAbsentSelectors !== undefined || check.expectedEnabledSelectors !== undefined || check.expectedScopedText !== undefined || check.steps !== undefined || check.captureArtifacts !== undefined || check.expectedNoConsoleErrors !== undefined || check.fullPage !== undefined) && check.url === undefined) issue('check_url_missing', `Check ${check.id} declares URL assertions but no URL.`);
+    const uiOnlyFields = check.expectedTitle !== undefined || check.expectedVisibleSelectors !== undefined || check.expectedHiddenSelectors !== undefined || check.expectedAbsentSelectors !== undefined || check.expectedEnabledSelectors !== undefined || check.expectedScopedText !== undefined || check.steps !== undefined || check.captureArtifacts !== undefined;
     if (uiOnlyFields && check.kind !== undefined && check.kind !== 'ui') issue('check_ui_field_mismatch', `Check ${check.id} declares rendered UI assertions but kind is ${check.kind}.`, 'Set kind to ui for checks that assert visibility, enabled state, scoped text, or interaction steps.');
     if (check.settleMs !== undefined && (!Number.isInteger(check.settleMs) || check.settleMs < 0)) issue('invalid_settle_ms', `Check ${check.id} settleMs must be a non-negative integer.`);
     if (check.workingDirectory !== undefined && (path.isAbsolute(check.workingDirectory) || check.workingDirectory.split(/[\\/]/).includes('..'))) issue('invalid_working_directory', `Check ${check.id} working directory must stay inside the workspace.`);
@@ -952,13 +1035,18 @@ export function coverageReport(change: Change, evidence: CoverageEvidenceInput[]
 }
 
 /** Planning-completeness rules used for readiness; incremental authoring may temporarily violate these. */
-export function validatePlanning(change: Change, artifactContents: Record<string, string> = {}, coverageEvidence: CoverageEvidenceInput[] = []): Issue[] {
+export interface ValidationContext { rollup?: boolean }
+
+export function validatePlanning(change: Change, artifactContents: Record<string, string> = {}, coverageEvidence: CoverageEvidenceInput[] = [], context: ValidationContext = {}): Issue[] {
   const issues: Issue[] = [];
   const issue = (code: string, message: string, recovery = 'Complete the planning content and run validate again.') => issues.push({ code, message, recovery });
-  if (!change.name?.trim() || !change.intent?.trim()) issue('missing_intent', 'Change name and intent are required.');
-  if (!change.outcome?.trim()) issue('missing_outcome', 'A measurable outcome is required.');
-  if (!Array.isArray(change.requirements) || change.requirements.length === 0) issue('missing_requirements', 'At least one requirement is required.');
-  if (!Array.isArray(change.checks) || change.checks.length === 0) issue('missing_checks', 'At least one verification check is required.');
+  // A rollup's acceptance is its closed children, so leaf planning content is not required at the parent.
+  if (!context.rollup) {
+    if (!change.name?.trim() || !change.intent?.trim()) issue('missing_intent', 'Change name and intent are required.');
+    if (!change.outcome?.trim()) issue('missing_outcome', 'A measurable outcome is required.');
+    if (!Array.isArray(change.requirements) || change.requirements.length === 0) issue('missing_requirements', 'At least one requirement is required.');
+    if (!Array.isArray(change.checks) || change.checks.length === 0) issue('missing_checks', 'At least one verification check is required.');
+  }
   if (change.mode === 'quick' && change.capabilityImpact === undefined) issue('missing_capability_impact', 'Quick changes must explicitly declare capabilityImpact none or delta.');
   if (change.capabilityImpact === 'none' && !change.capabilityRationale?.trim()) issue('missing_capability_rationale', 'A no-impact declaration requires a rationale.');
   if (change.capabilityImpact === 'none' && change.capabilityDelta?.operations.length) issue('conflicting_capability_impact', 'A no-impact declaration cannot include capability delta operations.');
@@ -977,24 +1065,24 @@ export function validatePlanning(change: Change, artifactContents: Record<string
   if (change.mode === 'standard') for (const requirement of change.requirements ?? []) if (!scenariosByRequirement.has(requirement.id)) issue('uncovered_scenario_requirement', `Requirement ${requirement.id} has no acceptance scenario.`);
   const tasks = change.tasks ?? [];
   const covered = new Set(tasks.flatMap(task => task.requirementIds ?? []));
-  for (const req of change.requirements ?? []) if (!covered.has(req.id)) issue('uncovered_requirement', `Requirement ${req.id} is not covered by a task.`);
+  if (!context.rollup) for (const req of change.requirements ?? []) if (!covered.has(req.id)) issue('uncovered_requirement', `Requirement ${req.id} is not covered by a task.`);
   const coverage = coverageReport(change, coverageEvidence);
   if (change.coveragePolicy === 'strict') {
     for (const requirementId of coverage.requirements.uncovered) issue('uncovered_check_requirement', `Requirement ${requirementId} is not linked to any verification check, linked task, or passing evidence record.`, `Add --requirement ${requirementId} to a check, link a check to a covering task with --task, or change coveragePolicy to advisory.`);
     for (const scenarioId of coverage.scenarios.uncovered) issue('uncovered_check_scenario', `Acceptance scenario ${scenarioId} is not linked to any verification check, linked task, or passing evidence record.`, `Add --scenario ${scenarioId} to a check, link a check to a covering task with --task, or change coveragePolicy to advisory.`);
     for (const taskId of coverage.tasks.uncovered) issue('uncovered_check_task', `Task ${taskId} is not linked to any verification check or passing evidence record.`, `Add --task ${taskId} to a check or record passing evidence for the task.`);
   }
-  if (tasks.length === 0) issue('missing_tasks', 'At least one task is required.');
+  if (!context.rollup && tasks.length === 0) issue('missing_tasks', 'At least one task is required.');
   if (!change.artifacts || (!change.artifacts['proposal.json'] && !change.artifacts['proposal.md'])) issue('missing_proposal_artifact', 'proposal.json must be declared; Markdown views are optional and legacy proposal.md declarations remain valid.');
   return issues;
 }
 
 /** Full planning readiness: structural integrity plus planning completeness. */
-export function validateChange(change: Change, artifactContents: Record<string, string> = {}, coverageEvidence: CoverageEvidenceInput[] = []): Issue[] {
-  return [...validateChangeStructure(change), ...validatePlanning(change, artifactContents, coverageEvidence)];
+export function validateChange(change: Change, artifactContents: Record<string, string> = {}, coverageEvidence: CoverageEvidenceInput[] = [], context: ValidationContext = {}): Issue[] {
+  return [...validateChangeStructure(change), ...validatePlanning(change, artifactContents, coverageEvidence, context)];
 }
 
-export function readiness(change: Change, artifactContents: Record<string, string> = {}, coverageEvidence: CoverageEvidenceInput[] = []): { ready: boolean; blockers: Issue[] } { const blockers = validateChange(change, artifactContents, coverageEvidence); return { ready: blockers.length === 0, blockers }; }
+export function readiness(change: Change, artifactContents: Record<string, string> = {}, coverageEvidence: CoverageEvidenceInput[] = [], context: ValidationContext = {}): { ready: boolean; blockers: Issue[] } { const blockers = validateChange(change, artifactContents, coverageEvidence, context); return { ready: blockers.length === 0, blockers }; }
 
 export interface PlanSetupStep { code: string; message: string; command: string }
 export interface PlanReadinessPreview {
@@ -1007,13 +1095,13 @@ export interface PlanReadinessPreview {
 }
 
 /** Predict what must happen after importing a plan so planning readiness becomes true. */
-export function previewPlanReadiness(change: Change, artifactContents: Record<string, string> = {}, options: { render?: boolean; coverageEvidence?: CoverageEvidenceInput[] } = {}): PlanReadinessPreview {
+export function previewPlanReadiness(change: Change, artifactContents: Record<string, string> = {}, options: { render?: boolean; coverageEvidence?: CoverageEvidenceInput[]; relativePath?: string } = {}): PlanReadinessPreview {
   const result = readiness(change, artifactContents, options.coverageEvidence);
   const contribution = capabilityContribution(change);
   const setup: PlanSetupStep[] = [];
   const designPath = change.artifacts?.['design.md'];
   if (change.mode === 'standard' && designPath && !hasSubstantiveContent(artifactContents[designPath])) {
-    const resolved = `.notchlet/changes/${change.id}/${designPath}`;
+    const resolved = `.notchlet/changes/${options.relativePath ?? change.id}/${designPath}`;
     setup.push({
       code: 'design_content_required',
       message: `Write substantive design content to ${resolved}; the scaffold template is not sufficient for a standard change.`,
@@ -1144,7 +1232,7 @@ const COLLECTION_FOR_KIND: Record<ChangeItemKind, ChangeCollection> = { requirem
 const KIND_LABEL: Record<ChangeItemKind, string> = { requirement: 'Requirement', check: 'Check', scenario: 'Acceptance scenario', decision: 'Design decision', task: 'Task' };
 const ITEM_PATCH_FIELDS: Record<ChangeItemKind, string[]> = {
   requirement: ['title', 'description'],
-  check: ['description', 'kind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'],
+  check: ['description', 'kind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedHiddenSelectors', 'expectedAbsentSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'],
   scenario: ['requirementId', 'when', 'then'],
   decision: ['decision', 'rationale'],
   task: ['title', 'dependencies', 'requirementIds'],
@@ -1171,6 +1259,8 @@ export interface ChangeItemPatch {
   expectedText?: string;
   expectedTitle?: string;
   expectedVisibleSelectors?: string[];
+  expectedHiddenSelectors?: string[];
+  expectedAbsentSelectors?: string[];
   expectedEnabledSelectors?: string[];
   expectedScopedText?: ScopedTextExpectation[];
   steps?: UiStep[];
@@ -1229,6 +1319,8 @@ function applyChangeItemPatch(change: Change, kind: ChangeItemKind, id: string, 
       ...(patch.expectedText === undefined ? {} : { expectedText: patch.expectedText }),
       ...(patch.expectedTitle === undefined ? {} : { expectedTitle: patch.expectedTitle }),
       ...(patch.expectedVisibleSelectors === undefined ? {} : { expectedVisibleSelectors: patch.expectedVisibleSelectors }),
+      ...(patch.expectedHiddenSelectors === undefined ? {} : { expectedHiddenSelectors: patch.expectedHiddenSelectors }),
+      ...(patch.expectedAbsentSelectors === undefined ? {} : { expectedAbsentSelectors: patch.expectedAbsentSelectors }),
       ...(patch.expectedEnabledSelectors === undefined ? {} : { expectedEnabledSelectors: patch.expectedEnabledSelectors }),
       ...(patch.expectedScopedText === undefined ? {} : { expectedScopedText: patch.expectedScopedText }),
       ...(patch.steps === undefined ? {} : { steps: patch.steps }),
@@ -1317,7 +1409,7 @@ export type ChangeOperation =
 
 const OPERATION_KIND_KEYS: Record<ChangeItemKind, string[]> = {
   requirement: ['op', 'kind', 'id', 'title', 'description'],
-  check: ['op', 'kind', 'id', 'description', 'checkKind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'],
+  check: ['op', 'kind', 'id', 'description', 'checkKind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedHiddenSelectors', 'expectedAbsentSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'],
   scenario: ['op', 'kind', 'id', 'requirementId', 'when', 'then'],
   decision: ['op', 'kind', 'id', 'decision', 'rationale'],
   task: ['op', 'kind', 'id', 'title', 'dependencies', 'requirementIds'],
@@ -1441,6 +1533,8 @@ export function parseChangeOperations(value: unknown): ChangeOperation[] {
       ...(entry.expectedText === undefined ? {} : { expectedText: stringField(entry, 'expectedText', label) }),
       ...(entry.expectedTitle === undefined ? {} : { expectedTitle: stringField(entry, 'expectedTitle', label) }),
       ...(optionalUniqueStrings(entry, 'expectedVisibleSelectors', label) === undefined ? {} : { expectedVisibleSelectors: optionalUniqueStrings(entry, 'expectedVisibleSelectors', label) }),
+      ...(optionalUniqueStrings(entry, 'expectedHiddenSelectors', label) === undefined ? {} : { expectedHiddenSelectors: optionalUniqueStrings(entry, 'expectedHiddenSelectors', label) }),
+      ...(optionalUniqueStrings(entry, 'expectedAbsentSelectors', label) === undefined ? {} : { expectedAbsentSelectors: optionalUniqueStrings(entry, 'expectedAbsentSelectors', label) }),
       ...(optionalUniqueStrings(entry, 'expectedEnabledSelectors', label) === undefined ? {} : { expectedEnabledSelectors: optionalUniqueStrings(entry, 'expectedEnabledSelectors', label) }),
       ...(entry.expectedScopedText === undefined ? {} : { expectedScopedText: scopedTextExpectations(entry, 'expectedScopedText', label) }),
       ...(entry.steps === undefined ? {} : { steps: uiSteps(entry, 'steps', label) }),
@@ -1476,7 +1570,7 @@ export function applyChangeOperations(change: Change, operations: ChangeOperatio
 
 /** Apply an ordered batch under one lock, validate the final structure, and bump the revision at most once. */
 export async function persistChangeOperations(root: string, id: string, operations: ChangeOperation[], options: { expectedRevision?: number; refreshExecution?: boolean } = {}): Promise<{ change: Change; applied: number }> {
-  const dir = changeDirectory(root, id);
+  const dir = await changeDirectoryFor(root, id);
   const file = path.join(dir, 'tasks.json');
   const release = await lock(file);
   try {
@@ -1692,6 +1786,8 @@ export function contractProjection(change: Change): unknown {
       expectedText: check.expectedText,
       expectedTitle: check.expectedTitle,
       expectedVisibleSelectors: check.expectedVisibleSelectors === undefined ? undefined : sortIds(check.expectedVisibleSelectors),
+      expectedHiddenSelectors: check.expectedHiddenSelectors === undefined ? undefined : sortIds(check.expectedHiddenSelectors),
+      expectedAbsentSelectors: check.expectedAbsentSelectors === undefined ? undefined : sortIds(check.expectedAbsentSelectors),
       expectedEnabledSelectors: check.expectedEnabledSelectors === undefined ? undefined : sortIds(check.expectedEnabledSelectors),
       expectedScopedText: check.expectedScopedText === undefined ? undefined : check.expectedScopedText
         .map(expectation => ({ selector: expectation.selector, contains: expectation.contains }))
@@ -1918,11 +2014,11 @@ export async function inspectChangeArtifacts(root: string, id: string): Promise<
   let directory: string;
   try {
     change = await readChange(root, id);
-    directory = changeDirectory(root, id);
+    directory = await changeDirectoryFor(root, id);
   } catch (error) {
     if (!(error instanceof WorkflowError) || error.code !== 'change_not_found') throw error;
     change = await readArchivedChange(root, id);
-    directory = archiveDirectory(root, id);
+    directory = (await resolveChangeLocation(root, id, { scope: 'archive' })).directory;
   }
   const artifacts: ArtifactStatus[] = [];
   const rendered = renderChangeArtifacts(change);
@@ -1948,7 +2044,8 @@ export async function inspectChangeArtifacts(root: string, id: string): Promise<
 /** Detect common artifact-placement mistakes, such as authoring design.md at the project root. */
 export async function diagnoseArtifactLocations(root: string, id: string, change: Change): Promise<Issue[]> {
   const issues: Issue[] = [];
-  const directory = changeDirectory(root, id);
+  const location = await resolveChangeLocation(root, id, { scope: 'merged' });
+  const directory = location.directory;
   for (const [artifact, relative] of Object.entries(change.artifacts)) {
     const target = artifactPath(directory, relative);
     try { await access(target); continue; }
@@ -1959,7 +2056,7 @@ export async function diagnoseArtifactLocations(root: string, id: string, change
       issues.push({
         code: 'misplaced_artifact',
         message: `${artifact} is declared at ${relative} but the change file is missing; a same-named file exists at the workspace root instead.`,
-        recovery: `Move ${path.basename(relative)} to .notchlet/changes/${id}/${relative}, then run \`notchlet validate ${id}\`.`,
+        recovery: `Move ${path.basename(relative)} to .notchlet/changes/${location.relativePath}/${relative}, then run \`notchlet validate ${location.relativePath}\`.`,
       });
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
@@ -1970,7 +2067,7 @@ export interface ArtifactWriteResult { change: Change; written: string[]; unchan
 
 /** Write rendered artifacts atomically and bump the revision once when anything changed. */
 export async function writeChangeArtifacts(root: string, id: string, options: { force?: boolean; markdown?: boolean } = {}): Promise<ArtifactWriteResult> {
-  const dir = changeDirectory(root, id);
+  const dir = await changeDirectoryFor(root, id);
   const file = path.join(dir, 'tasks.json');
   const release = await lock(file);
   try {
@@ -2073,7 +2170,7 @@ export function parseChangePlan(input: unknown): ChangePlan {
   const designDecisions = collection('designDecisions').map(parseDesignDecisionValue);
   const checks = collection('checks').map(value => {
     if (!record(value)) schemaError('change plan check must be an object.');
-    exactKeys(value, ['id', 'description', 'kind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'], ['id', 'description'], 'change plan check');
+    exactKeys(value, ['id', 'description', 'kind', 'command', 'url', 'expectedStatus', 'expectedBodyContains', 'expectedJson', 'expectedJsonContains', 'expectedJsonAt', 'expectedHeaders', 'waitFor', 'settleMs', 'expectedSelectors', 'expectedText', 'expectedTitle', 'expectedVisibleSelectors', 'expectedHiddenSelectors', 'expectedAbsentSelectors', 'expectedEnabledSelectors', 'expectedScopedText', 'steps', 'captureArtifacts', 'expectedNoConsoleErrors', 'fullPage', 'workingDirectory', 'environment', 'requirementIds', 'scenarioIds', 'taskIds'], ['id', 'description'], 'change plan check');
     return parseCheckValue(value);
   });
   const tasks = collection('tasks').map(value => {
@@ -2199,7 +2296,7 @@ export function projectChangePlan(name: string, plan: ChangePlan, options: { mod
 
 /** Apply a plan to a newly scaffolded change under one lock and one revision bump. */
 export async function importChangePlan(root: string, id: string, plan: ChangePlan, options: { expectedRevision?: number; render?: boolean; markdown?: boolean; name?: string; sourcePlan?: PlanSource } = {}): Promise<{ change: Change; written: string[]; rendered: string[] }> {
-  const dir = changeDirectory(root, id);
+  const dir = await changeDirectoryFor(root, id);
   const file = path.join(dir, 'tasks.json');
   const release = await lock(file);
   try {
@@ -2234,6 +2331,152 @@ export async function importChangePlan(root: string, id: string, plan: ChangePla
     await rename(temporary, file);
     return { change: next, written, rendered: options.render ? renderChangeArtifacts(next).map(artifact => artifact.path) : [] };
   } finally { await release(); }
+}
+
+/** One node of a declarative backlog tree plan; every node becomes a full change. */
+export interface ChangeTreePlanNode {
+  itemType: BacklogItemType;
+  title: string;
+  slug?: string;
+  plan: ChangePlan;
+  children: ChangeTreePlanNode[];
+}
+
+export interface ChangeTreePlan { schemaVersion: 1; tree: ChangeTreePlanNode; }
+
+function defaultNodePlan(title: string, itemType: BacklogItemType): ChangePlan {
+  return parseChangePlan({
+    mode: 'quick',
+    intent: `Coordinate ${title}: deliver this ${itemType.toLowerCase()} backlog node as one unit of work.`,
+    outcome: `${title} is complete when its child changes are verified and closed.`,
+    capabilityImpact: 'none',
+    capabilityRationale: 'Backlog node; capability deltas are declared by the leaf change that changes behavior.',
+  });
+}
+
+/** Parse and type-check a whole tree plan before any directory is created. */
+export function parseChangeTreePlan(input: unknown): ChangeTreePlan {
+  if (!record(input)) throw new WorkflowError('invalid_schema', 'Tree plan must be a JSON object.', 'Provide { "schemaVersion": 1, "tree": { "itemType": "epic", ... } }.');
+  exactKeys(input, ['schemaVersion', 'tree'], ['tree'], 'tree plan');
+  if (input.schemaVersion !== undefined && input.schemaVersion !== 1) throw new WorkflowError('invalid_schema', 'tree plan.schemaVersion must be 1.', 'Remove schemaVersion or set it to 1.');
+  const parseNode = (value: unknown, depth: number, label: string): ChangeTreePlanNode => {
+    if (!record(value)) schemaError(`${label} must be an object.`);
+    exactKeys(value, ['itemType', 'title', 'name', 'slug', 'plan', 'children'], ['itemType'], label);
+    const itemTypeText = stringField(value, 'itemType', label).toLowerCase();
+    if (!['epic', 'story', 'task', 'subtask'].includes(itemTypeText)) throw new WorkflowError('invalid_node_type', `${label}.itemType must be epic, story, task, or subtask.`, 'Backlog nodes nest EPIC > STORY > TASK > SUBTASK.');
+    if (depth > MAX_CHANGE_DEPTH) throw new WorkflowError('path_budget_exceeded', `${label} exceeds the maximum change depth of ${MAX_CHANGE_DEPTH}.`, 'Flatten the plan or import a smaller subtree.');
+    const itemType = itemTypeText.toUpperCase() as BacklogItemType;
+    const titleRaw = value.title ?? value.name;
+    if (typeof titleRaw !== 'string' || !titleRaw.trim()) schemaError(`${label}.title must be a non-empty string.`);
+    const title = titleRaw.trim();
+    const slug = value.slug === undefined ? undefined : stringField(value, 'slug', label);
+    const plan = value.plan === undefined ? defaultNodePlan(title, itemType) : parseChangePlan(value.plan);
+    if (value.children !== undefined && !Array.isArray(value.children)) schemaError(`${label}.children must be an array.`);
+    const children = ((value.children ?? []) as unknown[]).map((child, index) => {
+      const parsed = parseNode(child, depth + 1, `${label}.children[${index}]`);
+      if (!canParent(itemType, parsed.itemType)) throw new WorkflowError('child_type_invalid', `${parsed.itemType} cannot be a child of ${itemType} in ${label}.`, 'Backlog types must nest EPIC > STORY > TASK > SUBTASK.');
+      return parsed;
+    });
+    const slugs = new Set<string>();
+    for (const child of children) {
+      const key = (child.slug ?? stableId(child.title)).toLowerCase();
+      if (slugs.has(key)) throw new WorkflowError('duplicate_plan_path', `${label} has sibling nodes that both resolve to ${key}.`, 'Give siblings distinct titles or explicit slugs.');
+      slugs.add(key);
+    }
+    return { itemType, title, ...(slug === undefined ? {} : { slug }), plan, children };
+  };
+  return { schemaVersion: 1, tree: parseNode(input.tree, 1, 'tree plan.tree') };
+}
+
+export interface ProjectedTreeNode {
+  relativePath: string;
+  itemType: BacklogItemType;
+  title: string;
+  slug: string;
+  plan: ChangePlan;
+  change: Change;
+  children: ProjectedTreeNode[];
+}
+
+/** Resolve every node's path and project its change without touching the filesystem. */
+export function projectChangeTreePlan(plan: ChangeTreePlan): ProjectedTreeNode {
+  const project = (node: ChangeTreePlanNode, parentRelativePath: string | undefined): ProjectedTreeNode => {
+    const slug = node.slug ?? stableId(node.title);
+    const relativePath = composeNodeDirectory({ slug, ...(parentRelativePath === undefined ? {} : { parentRelativePath }) });
+    if (relativePath.length > MAX_CHANGE_RELATIVE_PATH) throw new WorkflowError('path_budget_exceeded', `Tree node path ${relativePath} is ${relativePath.length} characters (maximum ${MAX_CHANGE_RELATIVE_PATH}).`, 'Shorten node titles or move the workspace closer to the drive root.');
+    const mode = node.plan.mode ?? 'standard';
+    const { change } = projectChangePlan(node.title, node.plan, { mode, id: relativePath.split('/').at(-1)! });
+    return {
+      relativePath, itemType: node.itemType, title: node.title, slug, plan: node.plan, change,
+      children: node.children.map(child => project(child, relativePath)),
+    };
+  };
+  return project(plan.tree, undefined);
+}
+
+export interface TreeImportOptions { render?: boolean; markdown?: boolean; sourcePlan?: PlanSource; }
+export interface TreeImportNodeResult { relativePath: string; itemType: BacklogItemType; status: 'created' | 'reused'; written: string[]; rendered: string[]; }
+export interface TreeImportResult { root: string; nodes: TreeImportNodeResult[]; }
+
+async function changeDirectoryAt(root: string, relativePath: string, scope: 'active' | 'archive'): Promise<string | undefined> {
+  const directory = directoryForRelative(root, scope, relativePath);
+  try { await access(path.join(directory, 'tasks.json')); return directory; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return undefined; throw error; }
+}
+
+/**
+ * Create every node of a validated tree plan, or none of them.
+ * Existing nodes at the same path with the same backlog identity are reused, so reruns are idempotent.
+ */
+export async function importChangeTree(root: string, plan: ChangeTreePlan, options: TreeImportOptions = {}): Promise<TreeImportResult> {
+  const projected = projectChangeTreePlan(plan);
+  const preflight = async (node: ProjectedTreeNode): Promise<void> => {
+    const archived = await changeDirectoryAt(root, node.relativePath, 'archive');
+    if (archived) throw new WorkflowError('plan_path_conflict', `Tree node ${node.relativePath} already exists in the archive.`, `Restore or remove the archived change before importing it again, or rename this node in the plan.`);
+    const active = await changeDirectoryAt(root, node.relativePath, 'active');
+    if (active) {
+      const sidecar = await readBacklogSidecar(active);
+      if (!sidecar || sidecar.node.itemType !== node.itemType || sidecar.node.title !== node.title) {
+        throw new WorkflowError('plan_path_conflict', `Tree node ${node.relativePath} exists with a different backlog identity.`, 'Rename the node in the plan, or move the existing change before importing.');
+      }
+    }
+    for (const child of node.children) await preflight(child);
+  };
+  await preflight(projected);
+  const results: TreeImportNodeResult[] = [];
+  const created: string[] = [];
+  const visit = async (node: ProjectedTreeNode, parentRelativePath: string | undefined): Promise<void> => {
+    if (!(await changeDirectoryAt(root, node.relativePath, 'active'))) {
+      const scaffolded = await scaffoldNode(root, {
+        name: node.title,
+        title: node.title,
+        slug: node.slug,
+        itemType: node.itemType,
+        ...(parentRelativePath === undefined ? {} : { parent: parentRelativePath }),
+        mode: node.plan.mode ?? 'standard',
+      });
+      if (scaffolded.relativePath !== node.relativePath) {
+        throw new WorkflowError('plan_path_conflict', `Tree node ${node.relativePath} could not be created at its planned path.`, 'Check for case-insensitive path collisions and retry the import.');
+      }
+      created.push(scaffolded.relativePath);
+      const imported = await importChangePlan(root, scaffolded.relativePath, node.plan, {
+        ...(options.render === undefined ? {} : { render: options.render }),
+        ...(options.markdown === undefined ? {} : { markdown: options.markdown }),
+        name: node.title,
+        ...(options.sourcePlan === undefined ? {} : { sourcePlan: options.sourcePlan }),
+      });
+      results.push({ relativePath: scaffolded.relativePath, itemType: node.itemType, status: 'created', written: imported.written, rendered: imported.rendered });
+    } else {
+      results.push({ relativePath: node.relativePath, itemType: node.itemType, status: 'reused', written: [], rendered: [] });
+    }
+    for (const child of node.children) await visit(child, node.relativePath);
+  };
+  try { await visit(projected, undefined); }
+  catch (error) {
+    for (const relative of created.reverse()) await rm(directoryForRelative(root, 'active', relative), { recursive: true, force: true });
+    throw error;
+  }
+  return { root: projected.relativePath, nodes: results };
 }
 
 export interface PlanDrift {
@@ -2276,7 +2519,17 @@ export async function inspectPlan(root: string, change: Change): Promise<PlanIns
       return { drift, validation: { status: 'invalid', error: 'source plan path escapes the workspace' }, recordedSha256, contractSha256: contract };
     }
     const content = await readFile(absolute, 'utf8');
-    parseChangePlan(JSON.parse(content));
+    const parsed = JSON.parse(content) as unknown;
+    if (record(parsed) && 'tree' in parsed) {
+      const projected: ProjectedTreeNode[] = [];
+      const collect = (node: ProjectedTreeNode): void => { projected.push(node); node.children.forEach(collect); };
+      collect(projectChangeTreePlan(parseChangeTreePlan(parsed)));
+      if (!projected.some(node => node.change.id === change.id && node.change.name === change.name)) {
+        throw new WorkflowError('invalid_plan', `Tree plan no longer contains a node for ${change.id}.`, 'Restore the node in the tree plan, or run `notchlet change plan sync <change>` to accept the current plan hash.');
+      }
+    } else {
+      parseChangePlan(parsed);
+    }
     return { drift, validation: { status: 'ok' }, recordedSha256, currentSha256: createHash('sha256').update(content).digest('hex'), contractSha256: contract };
   } catch (error) {
     return { drift, validation: { status: 'invalid', error: error instanceof Error ? error.message : String(error) }, recordedSha256, contractSha256: contract };
@@ -2288,7 +2541,7 @@ export interface PresenceOnlyCheck { id: string; reason: string; }
 export function presenceOnlyUiChecks(change: Change): PresenceOnlyCheck[] {
   return change.checks.flatMap(check => {
     if (check.kind !== 'ui' && check.kind !== 'browser') return [];
-    const hasStateAssertion = Boolean(check.expectedVisibleSelectors?.length || check.expectedEnabledSelectors?.length || check.expectedScopedText?.length || check.expectedText?.trim() || check.expectedTitle?.trim() || check.expectedNoConsoleErrors)
+    const hasStateAssertion = Boolean(check.expectedVisibleSelectors?.length || check.expectedHiddenSelectors?.length || check.expectedAbsentSelectors?.length || check.expectedEnabledSelectors?.length || check.expectedScopedText?.length || check.expectedText?.trim() || check.expectedTitle?.trim() || check.expectedNoConsoleErrors)
       || (check.steps ?? []).some(step => ['waitForVisible', 'waitForText', 'assertText', 'assertUrl'].includes(step.action));
     return hasStateAssertion ? [] : [{ id: check.id, reason: 'declares selectors but no visibility, text, or state assertion' }];
   });
@@ -2296,6 +2549,40 @@ export function presenceOnlyUiChecks(change: Change): PresenceOnlyCheck[] {
 
 /** UI checks that mutate rendered state and therefore usually need an idempotent setup command before reruns. */
 export interface SetupAdvisory { code: 'setup_missing_for_mutating_ui'; checkIds: string[]; message: string; }
+export interface TaskLinkAdvisory { code: 'task_links_missing'; checkIds: string[]; taskIds: string[]; message: string; recovery: string; }
+/** Warn before verification when checks and tasks exist but no check names the task its evidence should satisfy. */
+export function taskLinkAdvisory(change: Change): TaskLinkAdvisory | undefined {
+  if (!change.tasks.length || !change.checks.length) return undefined;
+  const unlinkedChecks = change.checks.filter(check => !(check.taskIds?.length));
+  if (unlinkedChecks.length === 0) return undefined;
+  const taskIds = change.tasks.map(task => task.id);
+  return {
+    code: 'task_links_missing',
+    checkIds: unlinkedChecks.map(check => check.id),
+    taskIds,
+    message: `Check${unlinkedChecks.length === 1 ? '' : 's'} ${unlinkedChecks.map(check => check.id).join(', ')} ha${unlinkedChecks.length === 1 ? 's' : 've'} no task link, so recorded evidence may not satisfy task completion.`,
+    recovery: `Link checks once before verification: notchlet change update ${change.id} check ${unlinkedChecks[0].id} --task ${taskIds[0]} (add --requirement/--scenario links in the same pass).`,
+  };
+}
+
+/** A sole UI check that only asserts hidden or absent elements proves nothing rendered. */
+export interface HiddenOnlyAdvisory { code: 'hidden_only_sole_check'; checkIds: string[]; message: string; recovery: string; }
+export function hiddenOnlySoleCheckAdvisory(change: Change): HiddenOnlyAdvisory | undefined {
+  if (change.checks.length !== 1) return undefined;
+  const [check] = change.checks;
+  if (check.kind !== 'ui' && check.kind !== 'browser') return undefined;
+  if (!(check.expectedHiddenSelectors?.length || check.expectedAbsentSelectors?.length)) return undefined;
+  const positive = Boolean(check.expectedSelectors?.length || check.expectedVisibleSelectors?.length || check.expectedEnabledSelectors?.length || check.expectedScopedText?.length || check.expectedText?.trim() || check.expectedTitle?.trim());
+  const assertiveSteps = (check.steps ?? []).some(step => ['waitForVisible', 'waitForText', 'assertText', 'assertUrl'].includes(step.action));
+  if (positive || assertiveSteps) return undefined;
+  return {
+    code: 'hidden_only_sole_check',
+    checkIds: [check.id],
+    message: 'The only check asserts hidden or absent elements, so a blank or broken page can pass verification.',
+    recovery: `Add a positive assertion (notchlet change update ${change.id} check ${check.id} --expected-visible-selector <selector>) or a second check that proves the intended view rendered.`,
+  };
+}
+
 export function setupAdvisory(change: Change): SetupAdvisory | undefined {
   if (change.setupCommand) return undefined;
   const checkIds = change.checks.flatMap(check => {
@@ -2383,7 +2670,7 @@ export function seedCapabilityDeltaOperations(change: Change, rationale: string)
 
 /** Apply an authoring update under the task lock, validate the result, and bump the revision. */
 export async function mutateChange(root: string, id: string, mutate: (change: Change) => Change, options: { expectedRevision?: number; refreshExecution?: boolean } = {}): Promise<Change> {
-  const dir = changeDirectory(root, id);
+  const dir = await changeDirectoryFor(root, id);
   const file = path.join(dir, 'tasks.json');
   const release = await lock(file);
   try {
@@ -2405,7 +2692,7 @@ export async function mutateChange(root: string, id: string, mutate: (change: Ch
 /** Remove an authored item after guarding cross-references and historical check evidence. */
 export async function removeChangeItem(root: string, id: string, collection: ChangeCollection, itemId: string, options: { expectedRevision?: number } = {}): Promise<Change> {
   if (collection === 'checks') {
-    const file = path.join(changeDirectory(root, id), 'evidence.jsonl');
+    const file = path.join(await changeDirectoryFor(root, id), 'evidence.jsonl');
     try {
       const text = await readFile(file, 'utf8');
       for (const line of text.split(/\r?\n/).filter(Boolean)) {
@@ -2438,10 +2725,11 @@ export interface StateEvaluation {
   eligibleTasks: string[];
 }
 export interface ClosureStateInput { ready: boolean; blockers: Array<{ code: string; message: string; recovery: string }> }
+export interface StateEvaluationContext { rollup?: boolean; archived?: boolean }
 
 /** Evaluate only facts present in the supplied change/evidence; no clocks, Git, or remote calls are consulted. */
-export function evaluateState(change: Change, verification?: { missing?: string[]; failed?: string[]; stale?: string[]; unknown?: string[]; current?: string[]; independentlyVerified?: boolean; coverageEvidence?: CoverageEvidenceInput[]; remoteDelivery?: { status: RemoteDeliveryStatus; evidence?: string[] } }, artifactContents: Record<string, string> = {}, closure?: ClosureStateInput): StateEvaluation {
-  const planBlockers = validateChange(change, artifactContents, verification?.coverageEvidence).map(item => ({ ...item, source: 'engine' as const }));
+export function evaluateState(change: Change, verification?: { missing?: string[]; failed?: string[]; stale?: string[]; unknown?: string[]; current?: string[]; independentlyVerified?: boolean; coverageEvidence?: CoverageEvidenceInput[]; remoteDelivery?: { status: RemoteDeliveryStatus; evidence?: string[] } }, artifactContents: Record<string, string> = {}, closure?: ClosureStateInput, context: StateEvaluationContext = {}): StateEvaluation {
+  const planBlockers = validateChange(change, artifactContents, verification?.coverageEvidence, context.rollup ? { rollup: true } : {}).map(item => ({ ...item, source: 'engine' as const }));
   const done = new Set(change.tasks.filter(task => task.status === 'completed').map(task => task.id));
   const eligibleTasks = change.tasks.filter(task => task.status !== 'completed' && task.dependencies.every(id => done.has(id))).map(task => task.id);
   const completed = change.tasks.filter(task => task.status === 'completed').length;
@@ -2456,6 +2744,8 @@ export function evaluateState(change: Change, verification?: { missing?: string[
     ? 'not_applicable'
     : failed.length ? 'failed' : stale.length ? 'stale' : missing.length ? 'missing' : unknown.length ? 'unknown' : 'current';
   const allCompleted = change.tasks.length > 0 && completed === change.tasks.length;
+  const archived = context.archived === true;
+  const locallyClosed = archived || (allCompleted && status === 'current');
   const closureBlockers = (closure?.blockers ?? []).map(blocker => ({ ...blocker, source: 'engine' as const }));
   const blockers = [...planBlockers.map(({ code, message, source }) => ({ code, message, source }))];
   for (const blocker of closureBlockers) {
@@ -2467,7 +2757,7 @@ export function evaluateState(change: Change, verification?: { missing?: string[
     execution: { total: change.tasks.length, pending, inProgress, completed, status: allCompleted ? 'completed' : inProgress ? 'in_progress' : 'pending' },
     verification: { status, missing, failed, stale, unknown, current, independentlyVerified: verification?.independentlyVerified ?? false },
     coverage: coverageReport(change, verification?.coverageEvidence),
-    localClosure: { closed: allCompleted && status === 'current', status: allCompleted && status === 'current' ? 'closed' : allCompleted ? 'pending_review' : 'open' },
+    localClosure: { closed: locallyClosed, status: locallyClosed ? 'closed' : allCompleted ? 'pending_review' : 'open' },
     closure: { evaluated: closure !== undefined, ready: closure?.ready ?? false, blockerCount: closureBlockers.length, blockers: closureBlockers },
     remoteDelivery: { status: verification?.remoteDelivery?.status ?? 'unknown', evidence: [...(verification?.remoteDelivery?.evidence ?? [])] },
     blockers,
@@ -2725,7 +3015,7 @@ export async function transitionTask(file: string, taskId: string, status: TaskS
     const warnings: TransitionWarning[] = [];
     if (status === 'completed' && (options.requireEvidence || current.evidencePolicy !== 'end-of-change')) {
       let evidenceStatus: Awaited<ReturnType<typeof taskEvidenceStatus>>;
-      try { evidenceStatus = await taskEvidenceStatus(changeRootFor(file), current, taskId); }
+      try { evidenceStatus = await taskEvidenceStatus(await workspaceRootForChangeFile(file), current, taskId); }
       catch { evidenceStatus = { taskId, status: 'missing', checkIds: [], recovery: `notchlet verify ${current.id} --record --task ${taskId}` }; }
       if (evidenceStatus.status !== 'current') {
         if (options.requireEvidence) throw new WorkflowError('evidence_required', `Task ${taskId} cannot be completed without current passed evidence; evidence is ${evidenceStatus.status}.`, evidenceStatus.recovery);
@@ -2746,10 +3036,6 @@ export async function transitionTask(file: string, taskId: string, status: TaskS
     await rename(temp, file);
     return warnings.length ? { ...next, warnings } : next;
   } finally { await release(); }
-}
-
-function changeRootFor(file: string): string {
-  return path.resolve(path.dirname(file), '..', '..', '..');
 }
 
 /** Complete many tasks under one revision bump, honoring dependency order. */
@@ -2783,7 +3069,7 @@ export async function completeTasks(file: string, expectedRevision: number, opti
       if (unmet.length) throw new WorkflowError('dependencies_incomplete', `Task ${id} has incomplete dependencies: ${unmet.join(', ')}.`, 'Complete the task dependencies, reload status, then retry.');
       if (options.requireEvidence || current.evidencePolicy !== 'end-of-change') {
         let evidenceStatus: Awaited<ReturnType<typeof taskEvidenceStatus>>;
-        try { evidenceStatus = await taskEvidenceStatus(changeRootFor(file), current, id); }
+        try { evidenceStatus = await taskEvidenceStatus(await workspaceRootForChangeFile(file), current, id); }
         catch { evidenceStatus = { taskId: id, status: 'missing', checkIds: [], recovery: `notchlet verify ${current.id} --record --task ${id}` }; }
         if (evidenceStatus.status !== 'current') {
           if (options.requireEvidence) throw new WorkflowError('evidence_required', `Task ${id} cannot be completed without current passed evidence; evidence is ${evidenceStatus.status}.`, evidenceStatus.recovery);
