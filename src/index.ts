@@ -14,7 +14,7 @@ export * from './backlog.js';
 export * from './tree.js';
 export { detectObservationBasis, inspectGitContext } from './git-context.js';
 export type { GitContextResult, GitFingerprint, GitRepositoryIdentity, NamedRemote, NormalizedRemote } from './git-context.js';
-export { appendEvidence, archiveEvidenceArtifacts, evaluateEvidenceFreshness, evaluateVerificationFacets, evidenceAssetPath, evidenceRecovery, inspectEvidence, parseEvidenceRecord, readEvidence, resolveEvidenceScope, stageEvidenceAttachments, summarizeSourceBinding, taskEvidenceStatus, verificationRecovery } from './evidence.js';
+export { appendEvidence, archiveEvidenceArtifacts, evaluateEvidenceFreshness, evidenceFingerprint, evaluateVerificationFacets, evidenceAssetPath, evidenceRecovery, inspectEvidence, parseEvidenceRecord, readEvidence, resolveEvidenceScope, stageEvidenceAttachments, summarizeSourceBinding, taskEvidenceStatus, verificationRecovery } from './evidence.js';
 export type { CheckFacet, CheckFacetStatus, EvidenceAttachment, EvidenceAttachmentInput, EvidenceAttachmentKind, EvidenceCapture, EvidenceEnvironment, EvidenceFilter, EvidenceFreshness, EvidenceKind, EvidenceListing, EvidenceOutcome, EvidenceProvenance, EvidenceRecord, EvidenceScope, EvidenceScopeInput, EvidenceWriteInput, SetupPreflightEnvironment, SourceBindingSummary, TaskEvidenceStatus, VerificationFacets } from './evidence.js';
 export { fingerprintWorkspace, isSourceExcluded } from './source-files.js';
 export type { WorkspaceFingerprint } from './source-files.js';
