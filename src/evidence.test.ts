@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import os from 'node:os'; import path from 'node:path';
 import { execFile } from 'node:child_process'; import { promisify } from 'node:util';
-import { inspectEvidence, appendEvidence, evaluateEvidenceFreshness, parseEvidenceRecord, readEvidence, resolveEvidenceScope, taskEvidenceStatus, type EvidenceRecord } from './evidence.js';
+import { inspectEvidence, appendEvidence, evaluateEvidenceFreshness, evidenceFingerprint, parseEvidenceRecord, readEvidence, resolveEvidenceScope, taskEvidenceStatus, type EvidenceRecord } from './evidence.js';
 import { initWorkspace, parseChange, scaffold, transitionTask, writeChangeArtifacts } from './index.js';
 
 const exec = promisify(execFile);
@@ -289,5 +289,25 @@ test('task completion warns or blocks without current passed evidence and reopen
     changedCheck.checks[0].description = 'Changed acceptance check';
     await writeFile(file, JSON.stringify(changedCheck, null, 2));
     assert.equal((await taskEvidenceStatus(root, changedCheck, 'task-1')).status, 'stale');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('evidenceFingerprint reproduces the recorded v2 fingerprint from package contents', async () => {
+  const { root, id } = await setup();
+  try {
+    const dir = path.join(root, '.notchlet', 'changes', id);
+    const change = parseChange(await readFile(path.join(dir, 'tasks.json'), 'utf8'));
+    const artifacts: Record<string, string> = {};
+    for (const relative of Object.values(change.artifacts)) {
+      try { artifacts[relative] = await readFile(path.join(dir, relative), 'utf8'); } catch { /* ENOENT stays missing */ }
+    }
+    const record = await appendEvidence(root, id, input());
+    assert.equal(evidenceFingerprint(change, artifacts), record.artifactHash);
+    const progressed = { ...change, tasks: change.tasks.map(task => ({ ...task, status: 'completed' as const })) };
+    assert.equal(evidenceFingerprint(progressed, artifacts), record.artifactHash);
+    assert.notEqual(evidenceFingerprint({ ...change, intent: 'Changed intent' }, artifacts), record.artifactHash);
+    const withNote = { ...change, artifacts: { ...change.artifacts, 'notes.txt': 'notes.txt' } };
+    assert.notEqual(evidenceFingerprint(withNote, artifacts), evidenceFingerprint(withNote, { ...artifacts, 'notes.txt': 'note' }));
+    assert.equal(evidenceFingerprint(withNote, { ...artifacts, 'notes.txt': 'note' }), evidenceFingerprint(withNote, { ...artifacts, 'notes.txt': 'note' }));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
