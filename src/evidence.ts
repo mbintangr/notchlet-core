@@ -128,12 +128,36 @@ function changeContent(change: Change): unknown {
     environment: change.environment, setupCommand: change.setupCommand, teardownCommand: change.teardownCommand, coveragePolicy: change.coveragePolicy,
   };
 }
+/**
+ * Version 2 evidence fingerprint computed from artifact contents instead of the filesystem,
+ * so remote evaluators (the delivery service) can verify freshness against a sync package.
+ */
+export function evidenceFingerprint(change: Change, contents: Record<string, string | undefined>): string {
+  const entries: Array<[string, string]> = [];
+  for (const relative of Object.values(change.artifacts).sort()) {
+    if (DERIVED_VIEWS.has(relative)) continue;
+    if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..')) throw new Error(`Invalid artifact path: ${relative}`);
+    const content = contents[relative];
+    entries.push([relative, content === undefined ? 'missing' : hash(content)]);
+  }
+  return hash(JSON.stringify({ content: changeContent(change), entries }));
+}
+
 async function artifactHash(dir: string, change: Change, version: 1 | 2 = 2): Promise<string> {
+  if (version === 2) {
+    const contents: Record<string, string | undefined> = {};
+    for (const relative of Object.values(change.artifacts)) {
+      if (DERIVED_VIEWS.has(relative)) continue;
+      try { contents[relative] = await readFile(path.join(dir, relative), 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+    return evidenceFingerprint(change, contents);
+  }
   const entries: Array<[string, string]> = [];
   for (const relative of Object.values(change.artifacts).sort()) {
     // State and progress-derived or rendered views are excluded: the model content below carries
     // authored content, so task progress and re-rendering must not invalidate evidence.
-    if (relative === 'tasks.json' || (version === 2 ? DERIVED_VIEWS.has(relative) : relative === 'tasks.md')) continue;
+    if (relative === 'tasks.md') continue;
     if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..')) throw new Error(`Invalid artifact path: ${relative}`);
     try { entries.push([relative, hash(await readFile(path.join(dir, relative)))]); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; entries.push([relative, 'missing']); }
