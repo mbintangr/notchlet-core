@@ -182,17 +182,21 @@ test('quick change cannot close without explicit capability impact and rationale
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('a truncated Git observation makes verification unknown and blocks closure', async () => {
+test('oversized files no longer block closure while verified-path edits still do', async () => {
   const { root, id } = await setup();
   try {
     const fresh = await previewCapabilityClose(root, id);
     assert.equal(fresh.verification.status, 'current');
     await writeFile(path.join(root, 'oversized.bin'), Buffer.alloc(3 * 1024 * 1024, 1));
     const preview = await previewCapabilityClose(root, id);
-    assert.equal(preview.verification.status, 'unknown');
-    assert.deepEqual(preview.verification.unknown, ['CHECK-1']);
-    assert(preview.blockers.some(blocker => blocker.code === 'acceptance_not_current'));
-    assert.match(preview.blockers.find(blocker => blocker.code === 'acceptance_not_current')?.recovery ?? '', /notchlet verify/);
+    assert.equal(preview.verification.status, 'current');
+    assert.deepEqual(preview.blockers, []);
+    await writeFile(path.join(root, 'tracked.txt'), 'edited after verification\n');
+    const stale = await previewCapabilityClose(root, id);
+    assert.equal(stale.verification.status, 'stale');
+    assert.deepEqual(stale.verification.stale, ['CHECK-1']);
+    assert(stale.blockers.some(blocker => blocker.code === 'acceptance_not_current'));
+    assert.match(stale.blockers.find(blocker => blocker.code === 'acceptance_not_current')?.recovery ?? '', /notchlet verify/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

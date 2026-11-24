@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { inspectGitContext } from './git-context.js';
+import { changedTrackedPaths, inspectGitContext } from './git-context.js';
 
 const exec = promisify(execFile);
 async function run(cwd: string, ...args: string[]) { await exec('git', args, { cwd, windowsHide: true }); }
@@ -110,4 +110,20 @@ test('returns an explicit non-repository result', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'notchlet-outside-'));
   try { assert.deepEqual(await inspectGitContext(root), { available: true, isRepository: false, reason: 'not_a_repository' }); }
   finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('exposes verified tracked paths and changed-path diffs against a commit', async () => {
+  const root = await repo();
+  try {
+    await writeFile(path.join(root, '.env'), 'TRACKED SECRET');
+    await run(root, 'add', '.env'); await run(root, 'commit', '-m', 'tracked secret');
+    const before = await inspectGitContext(root); assert(before.isRepository);
+    const head = before.repository.head as string;
+    assert.deepEqual(before.trackedPaths, ['tracked.txt']);
+    await writeFile(path.join(root, 'tracked.txt'), 'changed'); await writeFile(path.join(root, 'new.txt'), 'new');
+    await writeFile(path.join(root, '.env'), 'TRACKED SECRET 2');
+    assert.deepEqual(await changedTrackedPaths(root, head), ['tracked.txt']);
+    await run(root, 'add', 'new.txt'); await run(root, 'commit', '-m', 'add new');
+    assert.deepEqual(await changedTrackedPaths(root, head), ['new.txt', 'tracked.txt'].sort());
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

@@ -29,7 +29,7 @@ export interface GitRepositoryIdentity {
   originRemote?: NormalizedRemote;
 }
 export type GitContextResult =
-  | { available: true; isRepository: true; repository: GitRepositoryIdentity; tracked: GitFingerprint; untracked: GitFingerprint; dirty: boolean }
+  | { available: true; isRepository: true; repository: GitRepositoryIdentity; tracked: GitFingerprint; untracked: GitFingerprint; dirty: boolean; trackedPaths: string[] }
   | { available: true; isRepository: false; reason: 'not_a_repository' }
   | { available: false; isRepository: false; reason: 'git_unavailable' };
 
@@ -94,6 +94,14 @@ export async function detectObservationBasis(start = process.cwd()): Promise<'gi
   } catch { return 'artifact'; }
 }
 
+/** List tracked source paths whose content differs from a commit, including deletions and uncommitted edits. */
+export async function changedTrackedPaths(start: string, commit: string): Promise<string[]> {
+  const cwd = await realpath(path.resolve(start)).catch(() => path.resolve(start));
+  const topLevel = await realpath(await git(cwd, 'rev-parse', '--show-toplevel'));
+  return (await git(topLevel, 'diff', '--name-only', '--no-renames', '-z', commit))
+    .split('\0').filter(Boolean).map(entry => entry.replace(/\\/g, '/')).filter(entry => !isSourceExcluded(entry));
+}
+
 export async function inspectGitContext(start = process.cwd()): Promise<GitContextResult> {
   const cwd = await realpath(path.resolve(start)).catch(() => path.resolve(start));
   try { await git(cwd, '--version'); }
@@ -119,10 +127,11 @@ export async function inspectGitContext(start = process.cwd()): Promise<GitConte
       .sort((a, b) => `${a.host}/${a.owner}/${a.repo}`.localeCompare(`${b.host}/${b.owner}/${b.repo}`));
     const originRemote = remoteDetails.find(remote => remote.name === 'origin');
     const trackedPaths = (await git(topLevel, 'ls-files', '-z')).split('\0').filter(Boolean);
+    const verifiedPaths = trackedPaths.filter(file => !isSourceExcluded(file)).map(file => file.replace(/\\/g, '/'));
     const untrackedPaths = (await git(topLevel, 'ls-files', '--others', '--exclude-standard', '-z')).split('\0').filter(file => Boolean(file) && !/evidence\.jsonl(?:\.lock)?$/.test(file.replace(/\\/g, '/')));
     const status = await git(topLevel, 'status', '--porcelain=v1', '-z', '--untracked-files=normal', '--no-renames').catch(() => '');
     const dirty = status.split('\0').filter(Boolean).some(entry => !isSourceExcluded(entry.slice(3)));
-    return { available: true, isRepository: true, repository: { topLevel, gitDir, commonDir, isLinkedWorktree: gitDir !== commonDir, branch, head, headTree, remotes, remoteDetails, ...(originRemote === undefined ? {} : { originRemote: { host: originRemote.host, owner: originRemote.owner, repo: originRemote.repo } }) }, tracked: await fingerprint(topLevel, trackedPaths), untracked: await fingerprint(topLevel, untrackedPaths), dirty };
+    return { available: true, isRepository: true, repository: { topLevel, gitDir, commonDir, isLinkedWorktree: gitDir !== commonDir, branch, head, headTree, remotes, remoteDetails, ...(originRemote === undefined ? {} : { originRemote: { host: originRemote.host, owner: originRemote.owner, repo: originRemote.repo } }) }, tracked: await fingerprint(topLevel, trackedPaths), untracked: await fingerprint(topLevel, untrackedPaths), dirty, trackedPaths: verifiedPaths };
   } catch (error) {
     const message = (error as NodeJS.ErrnoException).message ?? '';
     if (/not a git repository/i.test(message) || (error as NodeJS.ErrnoException).code === 'ENOENT') return { available: true, isRepository: false, reason: 'not_a_repository' };
