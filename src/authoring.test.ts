@@ -43,11 +43,88 @@ test('in-place item editing updates every authored kind while preserving unrelat
   assert.equal(decision.designDecisions[0].decision, 'Edit in place');
 
   const task = updateChangeItem(base, 'task', 'TASK-1', { requirementIds: ['REQ-2'] });
-  assert.deepEqual(task.tasks[0].requirementIds, ['REQ-2']);
+  assert.deepEqual(task.tasks[0].requirementIds, ['REQ-1', 'REQ-2']);
   assert.equal(task.tasks[0].status, 'in_progress');
+  const replacedTask = updateChangeItem(base, 'task', 'TASK-1', { requirementIds: ['REQ-2'], replaceLinks: true });
+  assert.deepEqual(replacedTask.tasks[0].requirementIds, ['REQ-2']);
   assert.throws(() => updateChangeItem(base, 'task', 'TASK-1', { status: 'completed' } as never), (error: unknown) => (error as { code?: string }).code === 'invalid_schema');
   assert.throws(() => updateChangeItem(base, 'requirement', 'REQ-404', { title: 'Missing' }), (error: unknown) => (error as { code?: string }).code === 'item_not_found');
   assert.throws(() => updateChangeItem(base, 'requirement', 'REQ-1', { command: 'node --version' } as never), (error: unknown) => (error as { code?: string }).code === 'invalid_schema');
+});
+
+test('link patches merge additive by default and honor replaceLinks in batches', () => {
+  const base: Change = {
+    schemaVersion: 1, id: 'link-merge', name: 'Link merge', createdAt: new Date().toISOString(), mode: 'standard',
+    intent: 'Merge links', outcome: 'Links survive edits', revision: 0,
+    requirements: [{ id: 'REQ-1', title: 'One', description: 'One' }, { id: 'REQ-2', title: 'Two', description: 'Two' }],
+    acceptanceScenarios: [
+      { id: 'SCENARIO-1', requirementId: 'REQ-1', when: 'First edit runs', then: 'First link persists' },
+      { id: 'SCENARIO-2', requirementId: 'REQ-1', when: 'Second edit runs', then: 'Second link persists' },
+    ],
+    designDecisions: [],
+    checks: [{ id: 'CHECK-1', description: 'Check links', command: 'node --version', requirementIds: ['REQ-1'], scenarioIds: ['SCENARIO-1'], taskIds: ['TASK-1'] }],
+    tasks: [
+      { id: 'TASK-1', title: 'First task', status: 'pending', dependencies: [], requirementIds: ['REQ-1'] },
+      { id: 'TASK-2', title: 'Second task', status: 'pending', dependencies: ['TASK-1'], requirementIds: ['REQ-1'] },
+    ],
+    artifacts: {},
+  };
+
+  const additive = updateChangeItem(base, 'check', 'CHECK-1', { requirementIds: ['REQ-2'], scenarioIds: ['SCENARIO-2'], taskIds: ['TASK-2'] });
+  assert.deepEqual(additive.checks[0].requirementIds, ['REQ-1', 'REQ-2']);
+  assert.deepEqual(additive.checks[0].scenarioIds, ['SCENARIO-1', 'SCENARIO-2']);
+  assert.deepEqual(additive.checks[0].taskIds, ['TASK-1', 'TASK-2']);
+
+  const replaced = updateChangeItem(base, 'check', 'CHECK-1', { taskIds: ['TASK-2'], replaceLinks: true });
+  assert.deepEqual(replaced.checks[0].taskIds, ['TASK-2']);
+  assert.deepEqual(replaced.checks[0].requirementIds, ['REQ-1']);
+  assert.deepEqual(replaced.checks[0].scenarioIds, ['SCENARIO-1']);
+  assert.throws(() => updateChangeItem(base, 'requirement', 'REQ-1', { title: 'Renamed', replaceLinks: true } as never), (error: unknown) => (error as { code?: string }).code === 'invalid_schema');
+
+  const merged = applyChangeOperations(base, parseChangeOperations([{ op: 'update', kind: 'check', id: 'CHECK-1', taskIds: ['TASK-2'] }]));
+  assert.deepEqual(merged.change.checks[0].taskIds, ['TASK-1', 'TASK-2']);
+  const swapped = applyChangeOperations(base, parseChangeOperations([{ op: 'update', kind: 'check', id: 'CHECK-1', taskIds: ['TASK-2'], replaceLinks: true }]));
+  assert.deepEqual(swapped.change.checks[0].taskIds, ['TASK-2']);
+  assert.throws(() => parseChangeOperations([{ op: 'update', kind: 'check', id: 'CHECK-1', replaceLinks: true }]), (error: unknown) => (error as { code?: string }).code === 'invalid_schema');
+  assert.throws(() => parseChangeOperations([{ op: 'update', kind: 'requirement', id: 'REQ-1', title: 'Renamed', replaceLinks: true }]), (error: unknown) => (error as { code?: string }).code === 'invalid_schema');
+});
+
+test('removal batches apply dependents-first regardless of operation order', () => {
+  const base: Change = {
+    schemaVersion: 1, id: 'removal-order', name: 'Removal order', createdAt: new Date().toISOString(), mode: 'standard',
+    intent: 'Remove in any order', outcome: 'Removals never depend on input order', revision: 0,
+    requirements: [{ id: 'REQ-1', title: 'One', description: 'One' }],
+    acceptanceScenarios: [{ id: 'SCENARIO-1', requirementId: 'REQ-1', when: 'Remove runs', then: 'Dependents go first' }],
+    designDecisions: [],
+    checks: [{ id: 'CHECK-1', description: 'Check links', command: 'node --version', requirementIds: ['REQ-1'], taskIds: ['TASK-2'] }],
+    tasks: [
+      { id: 'TASK-2', title: 'Dependent task', status: 'pending', dependencies: ['TASK-1'], requirementIds: ['REQ-1'] },
+      { id: 'TASK-1', title: 'Root task', status: 'pending', dependencies: [], requirementIds: ['REQ-1'] },
+    ],
+    artifacts: {},
+  };
+
+  const removed = applyChangeOperations(base, parseChangeOperations([
+    { op: 'remove', kind: 'requirement', id: 'REQ-1' },
+    { op: 'remove', kind: 'task', id: 'TASK-1' },
+    { op: 'remove', kind: 'scenario', id: 'SCENARIO-1' },
+    { op: 'remove', kind: 'check', id: 'CHECK-1' },
+    { op: 'remove', kind: 'task', id: 'TASK-2' },
+  ]));
+  assert.equal(removed.applied, 5);
+  assert.deepEqual(removed.change.requirements, []);
+  assert.deepEqual(removed.change.acceptanceScenarios, []);
+  assert.deepEqual(removed.change.checks, []);
+  assert.deepEqual(removed.change.tasks, []);
+
+  assert.throws(
+    () => applyChangeOperations(base, parseChangeOperations([{ op: 'remove', kind: 'requirement', id: 'REQ-1' }])),
+    (error: unknown) => {
+      const failure = error as { code?: string; recovery?: string };
+      if (failure.code !== 'requirement_in_use') return false;
+      return /SCENARIO-1/.test(failure.recovery ?? '') && /TASK-1/.test(failure.recovery ?? '') && /TASK-2/.test(failure.recovery ?? '') && /CHECK-1/.test(failure.recovery ?? '');
+    },
+  );
 });
 
 test('structural validation stays separate from planning completeness while readiness reports both', () => {
