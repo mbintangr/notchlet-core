@@ -123,7 +123,7 @@ test('legacy non-Git evidence without a source fingerprint stays fresh but sourc
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('Git observations stay unknown when truncated or recorded outside a repository', async () => {
+test('oversized files keep new evidence fresh while legacy truncated observations stay unknown', async () => {
   const { root, id } = await setup(true);
   try {
     const evidence = await appendEvidence(root, id, input());
@@ -131,7 +131,10 @@ test('Git observations stay unknown when truncated or recorded outside a reposit
     assert.equal(fresh.status, 'fresh');
     assert.equal(fresh.basis, 'git');
     await writeFile(path.join(root, 'oversized.bin'), Buffer.alloc(3 * 1024 * 1024, 1));
-    const truncated = await evaluateEvidenceFreshness(root, id, evidence);
+    const current = await evaluateEvidenceFreshness(root, id, evidence);
+    assert.equal(current.status, 'fresh');
+    const legacy = { ...evidence, fingerprintVersion: 2, git: { ...evidence.git, trackedPaths: undefined } } as unknown as EvidenceRecord;
+    const truncated = await evaluateEvidenceFreshness(root, id, legacy);
     assert.equal(truncated.status, 'unknown');
     assert.equal(truncated.basis, 'git');
     assert.match(truncated.reasons.join(' '), /truncated/);
@@ -150,6 +153,59 @@ test('Git observations stay unknown when truncated or recorded outside a reposit
     assert.equal(unknown.status, 'unknown');
     assert.match(unknown.reasons.join(' '), /Recorded Git observation is unavailable/);
   } finally { await rm(nonGit.root, { recursive: true, force: true }); }
+});
+
+test('verified-path evidence survives fast-forward and merge-commit integration', async () => {
+  const { root, id } = await setup(true);
+  try {
+    await git(root, 'checkout', '-b', 'feature');
+    await writeFile(path.join(root, 'feature.txt'), 'feature\n');
+    await git(root, 'add', 'feature.txt');
+    await git(root, 'commit', '-m', 'feature work');
+    const fastForwardEvidence = await appendEvidence(root, id, input());
+    await git(root, 'checkout', 'main');
+    await git(root, 'merge', '--ff-only', 'feature');
+    const fastForwarded = await evaluateEvidenceFreshness(root, id, fastForwardEvidence);
+    assert.equal(fastForwarded.status, 'fresh', JSON.stringify(fastForwarded.reasons));
+    assert.equal(fastForwarded.basis, 'git');
+    assert.equal(fastForwarded.sourceBound, true);
+
+    await git(root, 'checkout', '-b', 'feature-2');
+    await writeFile(path.join(root, 'feature2.txt'), 'two\n');
+    await git(root, 'add', 'feature2.txt');
+    await git(root, 'commit', '-m', 'feature 2 work');
+    const mergeEvidence = await appendEvidence(root, id, input());
+    await git(root, 'checkout', 'main');
+    await writeFile(path.join(root, 'main-only.txt'), 'main\n');
+    await git(root, 'add', 'main-only.txt');
+    await git(root, 'commit', '-m', 'main advanced');
+    await git(root, 'merge', '--no-ff', 'feature-2', '-m', 'merge feature 2');
+    const merged = await evaluateEvidenceFreshness(root, id, mergeEvidence);
+    assert.equal(merged.status, 'fresh', JSON.stringify(merged.reasons));
+
+    await writeFile(path.join(root, 'later.txt'), 'later\n');
+    await git(root, 'add', 'later.txt');
+    await git(root, 'commit', '-m', 'unrelated later commit');
+    assert.equal((await evaluateEvidenceFreshness(root, id, mergeEvidence)).status, 'fresh');
+
+    await writeFile(path.join(root, 'source.ts'), 'export const value = 9;\n');
+    const stale = await evaluateEvidenceFreshness(root, id, mergeEvidence);
+    assert.equal(stale.status, 'stale');
+    assert.match(stale.reasons.join(' '), /Verified source changed after verification: source\.ts/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('oversized tracked files leave new evidence fresh', async () => {
+  const { root, id } = await setup(true);
+  try {
+    await writeFile(path.join(root, 'asset.bin'), Buffer.alloc(3 * 1024 * 1024, 7));
+    await git(root, 'add', 'asset.bin');
+    await git(root, 'commit', '-m', 'oversized asset');
+    const evidence = await appendEvidence(root, id, input());
+    assert.equal((await evaluateEvidenceFreshness(root, id, evidence)).status, 'fresh');
+    await git(root, 'commit', '--allow-empty', '-m', 'later');
+    assert.equal((await evaluateEvidenceFreshness(root, id, evidence)).status, 'fresh');
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('concurrent writes remain complete JSONL and provenance is distinguished', async () => {
