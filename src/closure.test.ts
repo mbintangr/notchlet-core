@@ -200,6 +200,42 @@ test('oversized files no longer block closure while verified-path edits still do
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('close preview keeps source binding after fast-forward and merge-commit integration', async () => {
+  const { root, id } = await setup();
+  const run = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    const base = run('rev-parse', '--abbrev-ref', 'HEAD');
+    run('checkout', '-b', 'feature');
+    await writeFile(path.join(root, 'feature.txt'), 'feature\n');
+    run('add', 'feature.txt'); run('commit', '-m', 'feature work');
+    await appendEvidence(root, id, { kind: 'check', outcome: 'passed', summary: 'Acceptance check passed', requirementIds: ['REQ-BASE', 'REQ-ADD'], taskIds: ['TASK-1'], checkIds: ['CHECK-1'], provenance: 'recorded' });
+    run('checkout', base);
+    run('merge', '--ff-only', 'feature');
+    const fastForwarded = await previewCapabilityClose(root, id);
+    assert.equal(fastForwarded.verification.status, 'current');
+    assert.equal(fastForwarded.sourceBinding.bound, true);
+    assert.equal(fastForwarded.sourceBinding.basis, 'git');
+    assert.deepEqual(fastForwarded.blockers, []);
+
+    run('checkout', '-b', 'feature-2');
+    await writeFile(path.join(root, 'feature2.txt'), 'two\n');
+    run('add', 'feature2.txt'); run('commit', '-m', 'feature 2 work');
+    await appendEvidence(root, id, { kind: 'check', outcome: 'passed', summary: 'Acceptance check passed', requirementIds: ['REQ-BASE', 'REQ-ADD'], taskIds: ['TASK-1'], checkIds: ['CHECK-1'], provenance: 'recorded' });
+    run('checkout', base);
+    await writeFile(path.join(root, 'base-only.txt'), 'base\n');
+    run('add', 'base-only.txt'); run('commit', '-m', 'base advanced');
+    run('merge', '--no-ff', 'feature-2', '-m', 'merge feature 2');
+    const merged = await previewCapabilityClose(root, id);
+    assert.equal(merged.verification.status, 'current');
+    assert.equal(merged.sourceBinding.bound, true);
+    assert.deepEqual(merged.blockers, []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('quick no-impact change closes in a non-Git workspace without a capability baseline', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'notchlet-no-impact-'));
   try {
