@@ -1198,8 +1198,12 @@ export function addTaskToChange(change: Change, task: Task): Change {
 
 function removeFromChangeValue(change: Change, collection: ChangeCollection, id: string): Change {
   if (collection === 'requirements') {
-    const referenced = change.acceptanceScenarios.some(item => item.requirementId === id) || change.tasks.some(item => item.requirementIds.includes(id)) || change.checks.some(item => item.requirementIds?.includes(id));
-    if (referenced) throw new WorkflowError('requirement_in_use', `Requirement ${id} is still referenced by a scenario, task, or check.`, 'Remove or repoint the dependent scenario, task, or check first.');
+    const dependents = [
+      ...change.acceptanceScenarios.filter(item => item.requirementId === id).map(item => item.id),
+      ...change.tasks.filter(item => item.requirementIds.includes(id)).map(item => item.id),
+      ...change.checks.filter(item => item.requirementIds?.includes(id)).map(item => item.id),
+    ];
+    if (dependents.length) throw new WorkflowError('requirement_in_use', `Requirement ${id} is still referenced by a scenario, task, or check.`, `Remove or repoint the dependent items first: ${dependents.join(', ')}.`);
     if (!change.requirements.some(item => item.id === id)) throw new WorkflowError('item_not_found', `Requirement ${id} was not found.`, 'Inspect the change with `notchlet change show`.');
     return { ...change, requirements: change.requirements.filter(item => item.id !== id) };
   }
@@ -1278,6 +1282,8 @@ export interface ChangeItemPatch {
   requirementIds?: string[];
   scenarioIds?: string[];
   taskIds?: string[];
+  /** Replace provided link fields instead of merging them with existing links. */
+  replaceLinks?: boolean;
 }
 
 function assertStructuralChange(change: Change): void {
@@ -1289,9 +1295,27 @@ function unsupportedPatchField(kind: ChangeItemKind, field: string): never {
   throw new WorkflowError('invalid_schema', `${KIND_LABEL[kind]} items do not support the "${field}" field.`, `Edit only these ${kind} fields: ${ITEM_PATCH_FIELDS[kind].join(', ')}.`);
 }
 
+/** Link fields merge with existing links unless the patch explicitly replaces them. */
+function linkUpdates(existing: ChangeItemPatch, patch: ChangeItemPatch): ChangeItemPatch {
+  const replace = patch.replaceLinks === true;
+  const links: ChangeItemPatch = {};
+  for (const field of ['requirementIds', 'scenarioIds', 'taskIds', 'dependencies'] as const) {
+    const provided = patch[field];
+    if (provided === undefined) continue;
+    links[field] = replace ? provided : [...new Set([...(existing[field] ?? []), ...provided])];
+  }
+  return links;
+}
+
 /** Apply a patch to one authored item without validating cross-references; the task status is never touched. */
 function applyChangeItemPatch(change: Change, kind: ChangeItemKind, id: string, patch: ChangeItemPatch): Change {
-  for (const field of Object.keys(patch)) if (!ITEM_PATCH_FIELDS[kind].includes(field)) unsupportedPatchField(kind, field);
+  for (const field of Object.keys(patch)) {
+    if (field === 'replaceLinks') {
+      if (kind !== 'check' && kind !== 'task') unsupportedPatchField(kind, field);
+      continue;
+    }
+    if (!ITEM_PATCH_FIELDS[kind].includes(field)) unsupportedPatchField(kind, field);
+  }
   const missing = (): never => { throw new WorkflowError('item_not_found', `${KIND_LABEL[kind]} ${id} was not found.`, 'Inspect the change with `notchlet change show`.'); };
   if (kind === 'requirement') {
     const current = change.requirements.find(item => item.id === id) ?? missing();
@@ -1329,9 +1353,7 @@ function applyChangeItemPatch(change: Change, kind: ChangeItemKind, id: string, 
       ...(patch.fullPage === undefined ? {} : { fullPage: patch.fullPage }),
       ...(patch.workingDirectory === undefined ? {} : { workingDirectory: patch.workingDirectory }),
       ...(patch.environment === undefined ? {} : { environment: patch.environment }),
-      ...(patch.requirementIds === undefined ? {} : { requirementIds: patch.requirementIds }),
-      ...(patch.scenarioIds === undefined ? {} : { scenarioIds: patch.scenarioIds }),
-      ...(patch.taskIds === undefined ? {} : { taskIds: patch.taskIds }),
+      ...linkUpdates(current, patch),
     };
     const parsed = parseCheckValue(updated);
     return { ...change, checks: change.checks.map(item => item.id === id ? parsed : item) };
@@ -1361,8 +1383,7 @@ function applyChangeItemPatch(change: Change, kind: ChangeItemKind, id: string, 
   const updated = {
     ...current,
     ...(patch.title === undefined ? {} : { title: patch.title }),
-    ...(patch.dependencies === undefined ? {} : { dependencies: patch.dependencies }),
-    ...(patch.requirementIds === undefined ? {} : { requirementIds: patch.requirementIds }),
+    ...linkUpdates(current, patch),
   };
   const parsed = parseTask(updated);
   return { ...change, tasks: change.tasks.map(item => item.id === id ? parsed : item) };
@@ -1416,7 +1437,7 @@ const OPERATION_KIND_KEYS: Record<ChangeItemKind, string[]> = {
 };
 
 function operationPatchKeys(kind: ChangeItemKind): string[] {
-  return ['op', 'kind', 'id', ...ITEM_PATCH_FIELDS[kind].filter(field => field !== 'kind'), ...(kind === 'check' ? ['checkKind'] : [])];
+  return ['op', 'kind', 'id', ...ITEM_PATCH_FIELDS[kind].filter(field => field !== 'kind'), ...(kind === 'check' ? ['checkKind'] : []), ...(kind === 'check' || kind === 'task' ? ['replaceLinks'] : [])];
 }
 
 function httpStatusField(value: JsonRecord, key: string, label: string): number {
@@ -1466,6 +1487,10 @@ function patchFromRecord(value: JsonRecord, kind: ChangeItemKind, label: string)
     }
   }
   if (kind === 'check' && value.checkKind !== undefined) patch.kind = stringField(value, 'checkKind', label) as CheckKind;
+  if (value.replaceLinks !== undefined) {
+    if (kind !== 'check' && kind !== 'task') throw new WorkflowError('invalid_schema', `${label}.replaceLinks is only valid for check or task updates.`, 'Remove replaceLinks or update check/task link fields.');
+    if (booleanField(value, 'replaceLinks', label)) patch.replaceLinks = true;
+  }
   return patch;
 }
 
@@ -1508,6 +1533,9 @@ export function parseChangeOperations(value: unknown): ChangeOperation[] {
     if (entry.op === 'update') {
       exactKeys(entry, operationPatchKeys(kind), ['op', 'kind', 'id'], label);
       const patch = patchFromRecord(entry, kind, label);
+      if (patch.replaceLinks === true && !['requirementIds', 'scenarioIds', 'taskIds', 'dependencies'].some(field => (patch as Record<string, unknown>)[field] !== undefined)) {
+        throw new WorkflowError('invalid_schema', `${label}.replaceLinks requires at least one link field (requirementIds, scenarioIds, taskIds, dependencies).`, 'Provide a link field to replace or remove replaceLinks.');
+      }
       if (Object.keys(patch).length === 0) throw new WorkflowError('invalid_schema', `${label} must update at least one field.`, 'Correct the batch operation and try again.');
       return { op: 'update', kind, id: stringField(entry, 'id', label), patch } as ChangeOperation;
     }
@@ -1562,9 +1590,39 @@ function applyChangeOperation(change: Change, operation: ChangeOperation): Chang
 }
 
 /** Apply ordered operations in memory; structural references are checked only on the final state. */
+type RemoveOperation = Extract<ChangeOperation, { op: 'remove' }>;
+
+/** Order removed tasks so dependents are removed before the tasks they depend on. */
+function orderTaskRemovals(change: Change, operations: RemoveOperation[]): RemoveOperation[] {
+  const remaining = [...operations];
+  const ordered: RemoveOperation[] = [];
+  while (remaining.length) {
+    const index = remaining.findIndex(candidate => !remaining.some(other => other.id !== candidate.id && (change.tasks.find(task => task.id === other.id)?.dependencies ?? []).includes(candidate.id)));
+    if (index < 0) { ordered.push(...remaining); break; }
+    ordered.push(...remaining.splice(index, 1));
+  }
+  return ordered;
+}
+
+/** Reorder remove operations dependents-first so batches apply regardless of operation order. */
+function orderRemovalOperations(change: Change, operations: ChangeOperation[]): ChangeOperation[] {
+  const positions = operations.flatMap((operation, index) => operation.op === 'remove' ? [index] : []);
+  if (positions.length < 2) return operations;
+  const removals = positions.map(index => operations[index] as RemoveOperation);
+  const ordered = [
+    ...removals.filter(operation => operation.kind === 'check'),
+    ...removals.filter(operation => operation.kind === 'scenario' || operation.kind === 'decision'),
+    ...orderTaskRemovals(change, removals.filter(operation => operation.kind === 'task')),
+    ...removals.filter(operation => operation.kind === 'requirement'),
+  ];
+  const result = [...operations];
+  positions.forEach((position, cursor) => { result[position] = ordered[cursor]; });
+  return result;
+}
+
 export function applyChangeOperations(change: Change, operations: ChangeOperation[]): { change: Change; applied: number } {
   let next = change;
-  for (const operation of operations) next = applyChangeOperation(next, operation);
+  for (const operation of orderRemovalOperations(change, operations)) next = applyChangeOperation(next, operation);
   return { change: next, applied: operations.length };
 }
 
